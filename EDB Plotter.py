@@ -211,7 +211,26 @@ class App(tk.Tk):
         self.build()
 
     def build(self):
-        top = ttk.Frame(self, padding=6)
+        viewport = ttk.Frame(self)
+        viewport.pack(fill="both", expand=True)
+        self.scroll_canvas = tk.Canvas(viewport, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(viewport, orient="vertical", command=self.scroll_canvas.yview)
+        self.scroll_canvas.configure(yscrollcommand=scrollbar.set)
+        self.scroll_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        content = ttk.Frame(self.scroll_canvas)
+        content_window = self.scroll_canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind(
+            "<Configure>",
+            lambda _: self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all")),
+        )
+        self.scroll_canvas.bind(
+            "<Configure>",
+            lambda event: self.scroll_canvas.itemconfigure(content_window, width=event.width),
+        )
+
+        top = ttk.Frame(content, padding=6)
         top.pack(fill="x")
 
         files = ttk.LabelFrame(top, text="Files (acquisition order)", padding=6)
@@ -251,13 +270,13 @@ class App(tk.Tk):
             box.bind("<Return>", lambda _: self.update_plot())
         ttk.Button(axes, text="Apply axes", command=self.update_plot).pack(side="left")
 
-        act = ttk.Frame(self, padding=(6, 0))
+        act = ttk.Frame(content, padding=(6, 0))
         act.pack(fill="x")
         for text, command in (("Load / plot", self.load), ("Fit", self.do_fit),
                               ("Clear fit region", self.clear_region), ("Export fit CSV", self.export_fit)):
             ttk.Button(act, text=text, command=command).pack(side="left", padx=2, pady=3)
 
-        modes = ttk.LabelFrame(self, text="Plot mode (drag on the plot)", padding=4)
+        modes = ttk.LabelFrame(content, text="Plot mode (drag on the plot)", padding=4)
         modes.pack(fill="x", padx=6, pady=2)
         for text, value in (("Fit region", "fit"), ("Zoom", "zoom"), ("Cull", "cull"), ("Keep box", "keep")):
             ttk.Radiobutton(modes, text=text, value=value, variable=self.mode,
@@ -266,8 +285,8 @@ class App(tk.Tk):
                               ("Reset zoom", self.reset_zoom), ("Save altered data", self.save_altered)):
             ttk.Button(modes, text=text, command=command).pack(side="left", padx=3)
 
-        ttk.Label(self, textvariable=self.status).pack(anchor="w", padx=8)
-        ttk.Label(self, textvariable=self.fit_text, wraplength=1100, justify="left").pack(anchor="w", padx=8)
+        ttk.Label(content, textvariable=self.status).pack(anchor="w", padx=8)
+        ttk.Label(content, textvariable=self.fit_text, wraplength=1100, justify="left").pack(anchor="w", padx=8)
 
         self.figure = Figure(figsize=(8, 5))
         self.axis = self.figure.add_subplot(111)
@@ -277,9 +296,9 @@ class App(tk.Tk):
         self.err_bars = LineCollection([], colors="tab:blue", linewidths=0.6, alpha=0.6, zorder=1)
         self.axis.add_collection(self.err_bars)
         self.fit_line, = self.axis.plot([], [], color="tab:red", linewidth=1.8, label="Monotone convex fit")
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=content)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, self)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, content)
         self.span = SpanSelector(self.axis, self.on_span, "horizontal", useblit=True, interactive=False,
                                  props={"alpha": 0.2, "facecolor": "crimson"})
         self.rect = RectangleSelector(self.axis, self.on_box, useblit=True, button=[1], minspanx=3, minspany=3,
