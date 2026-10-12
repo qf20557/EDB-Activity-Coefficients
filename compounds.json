@@ -1,0 +1,30 @@
+{
+  "Malonic acid": {
+    "density_g_ml": 1.6,
+    "molar_mass_g_mol": 104.061
+  },
+  "Tween 20": {
+    "density_g_ml": 1.095,
+    "molar_mass_g_mol": 1227.53
+  },
+  "Water": {
+    "density_g_ml": 0.997,
+    "molar_mass_g_mol": 18.01528
+  },
+  "3-nitrophenol": {
+    "density_g_ml": 1.5,
+    "molar_mass_g_mol": 139.11
+  },
+  "Triton X-100": {
+    "density_g_ml": 1.07,
+    "molar_mass_g_mol": 636.0
+  },
+  "Ethanol": {
+    "density_g_ml": 0.789,
+    "molar_mass_g_mol": 46.07
+  },
+  "Methylmalonic acid": {
+    "density_g_ml": 1.455,
+    "molar_mass_g_mol": 118.09
+  }
+}
