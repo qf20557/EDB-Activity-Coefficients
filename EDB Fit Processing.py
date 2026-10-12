@@ -1,18 +1,3 @@
-"""EDB timed-interval MFS and gradient from a polynomial fit.
-
-Inputs
-  1. Polynomial-fit CSV (time_s, fitted_radius_um, fitted_radius_squared_um2) from the EDB plotter.
-  2. Altered/culled raw EDB CSV (time_s, radius_um). Its FIRST data point is the initial radius of the
-     starting (wet) droplet; all points are plotted (as radius^2) on top of the fit for comparison.
-  3. compounds.json beside this script (density_g_ml, molar_mass_g_mol per compound).
-
-Model (additive volumes, constant densities)
-  V(t) = V0 * (r(t) / r0)^3, with r(t)^2 taken from the polynomial fit and V0 from the entered masses.
-  While V(t) >= V_dry (= V_A + V_B at the initial masses) solvent is still present and A and B are
-  unchanged, so x_A stays at its initial dry value. Below V_dry, solvent is gone, B is conserved and
-  A is lost:  n_A = (V - V_B) * rho_A / M_A.  MFS = x_A = n_A / (n_A + n_B)  (solvent excluded).
-Output per interval: time-averaged x_A and the least-squares gradient d(r^2)/dt of the fitted curve.
-"""
 import csv
 import json
 import math

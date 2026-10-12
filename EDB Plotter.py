@@ -6,11 +6,11 @@ from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector, SpanSelector
 
 RADIUS_UNCERTAINTY_UM = 0.1
+MAX_ERROR_BARS = 20000  # error bars are thinned to this many; at that density they overlap into a band anyway
 MAX_FIT_BINS = 3000
 DICT_TAUS = np.geomspace(0.003, 30.0, 70)
 
@@ -293,8 +293,7 @@ class App(tk.Tk):
         self.axis.grid(alpha=0.3)
         self.data_line, = self.axis.plot([], [], linestyle="none", marker="x", markersize=4,
                                          markeredgewidth=0.8, color="tab:blue", label="Data")
-        self.err_bars = LineCollection([], colors="tab:blue", linewidths=0.6, alpha=0.6, zorder=1)
-        self.axis.add_collection(self.err_bars)
+        self.err_bars, = self.axis.plot([], [], color="tab:blue", linewidth=0.6, alpha=0.6, zorder=1)
         self.fit_line, = self.axis.plot([], [], color="tab:red", linewidth=1.8, label="Monotone convex fit")
         self.canvas = FigureCanvasTkAgg(self.figure, master=content)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -518,17 +517,21 @@ class App(tk.Tk):
             y = r * r if squared else r
             self.data_line.set_data(t[::stride], y[::stride])
             if show_err:
-                ts, ys, rs = t[::stride], y[::stride], r[::stride]
+                step = max(1, len(t[::stride]) // MAX_ERROR_BARS) * stride
+                ts, ys, rs = t[::step], y[::step], r[::step]
                 err = RADIUS_UNCERTAINTY_UM * (2 * rs if squared else np.ones_like(rs))
-                self.err_bars.set_segments(np.stack([np.column_stack([ts, ys - err]),
-                                                     np.column_stack([ts, ys + err])], axis=1))
+                x_bars = np.repeat(ts, 3)
+                y_bars = np.empty(3 * len(ts))
+                y_bars[0::3], y_bars[1::3], y_bars[2::3] = ys - err, ys + err, np.nan
+                x_bars[2::3] = np.nan  # NaN breaks the line, so one Line2D draws every vertical bar
+                self.err_bars.set_data(x_bars, y_bars)
             else:
-                self.err_bars.set_segments([])
+                self.err_bars.set_data([], [])
             ax.set_title(f"EDB evaporation \u2014 {len(t):,} retained; "
                          f"{len(self.store.data) - len(t):,} culled; {len(t[::stride]):,} plotted")
         else:
             self.data_line.set_data([], [])
-            self.err_bars.set_segments([])
+            self.err_bars.set_data([], [])
         if self.fit_band is not None:
             self.fit_band.remove()
             self.fit_band = None
@@ -545,9 +548,6 @@ class App(tk.Tk):
         if rescale:
             ax.autoscale(enable=True)
             ax.relim()
-            segments = self.err_bars.get_segments()
-            if segments:
-                ax.update_datalim(np.vstack(segments))
             ax.autoscale_view()
         try:
             b = [self.number(k, k.replace("_", " ")) for k in ("x_min", "x_max", "y_min", "y_max")]
