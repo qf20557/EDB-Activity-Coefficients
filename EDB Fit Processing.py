@@ -61,8 +61,6 @@ def read_fit_csv(path):
 
 
 def read_edb_csv(path):
-    """Read time (s) and radius (um) from the altered EDB CSV (comma or whitespace separated, header
-    optional). Returns arrays of valid rows in file order; the first row is the initial point."""
     with open(path, encoding="utf-8-sig", errors="replace") as handle:
         sample = "".join(handle.readline() for _ in range(5))
     sep = "," if "," in sample else r"\s+"
@@ -77,7 +75,6 @@ def read_edb_csv(path):
 
 
 def make_mfs_function(records, name_a, name_b, name_s, mass_a, mass_b, mass_s, r0):
-    """Return (mfs(r2), info). mfs maps fitted radius^2 (um^2) to x_A; NaN where A would be negative."""
     if len({name_a, name_b, name_s}) < 3:
         raise ValueError("Choose three different compounds for A, B and the solvent.")
     if not all(math.isfinite(v) for v in (mass_a, mass_b, mass_s, r0)):
@@ -115,8 +112,6 @@ def bin_edges(lo, hi, width):
 
 
 def interval_results(t, r2, mfs, lo, hi, width):
-    """Per interval: time-averaged MFS (trapezoid) and least-squares d(r^2)/dt of the fitted curve.
-    Returns (rows [(mfs, gradient)], skipped_count)."""
     x_all = mfs(r2)
     edges = bin_edges(lo, hi, width)
     rows, skipped = [], 0
@@ -135,7 +130,6 @@ def interval_results(t, r2, mfs, lo, hi, width):
 
 
 def parse_limits(texts):
-    """Four strings (blank = automatic) -> [xmin, xmax, ymin, ymax] floats/None. Raises ValueError."""
     values = []
     for (label, _), text in zip(LIMIT_KEYS, texts):
         text = text.strip()
