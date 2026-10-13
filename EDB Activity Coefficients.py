@@ -13,7 +13,6 @@ AIOMFAC_COLUMN = "a_x"
 
 
 def read_mfs_gradient(path):
-    """Two-column CSV: column 1 = Average MFS, column 2 = gradient."""
     df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
     if df.shape[1] < 2:
         raise ValueError("The CSV needs two columns: Average MFS and Gradient.")
@@ -27,7 +26,6 @@ def read_mfs_gradient(path):
 
 
 def parse_aiomfac(path):
-    """Parse an AIOMFAC-web text file. Returns {component number: DataFrame of its table}."""
     with open(path, encoding="utf-8-sig", errors="replace") as handle:
         lines = handle.read().splitlines()
     tables, i = {}, 0
@@ -58,7 +56,6 @@ def parse_aiomfac(path):
 
 
 def aiomfac_curve(tables, component, quantity=AIOMFAC_COLUMN):
-    """Return x_i(component) and a_x(component), sorted by x. Rows with a non-zero flag are dropped."""
     if component not in tables:
         raise ValueError(f"Component {component} not in file (found: {', '.join(tables)}).")
     df = tables[component]
@@ -78,8 +75,6 @@ def aiomfac_curve(tables, component, quantity=AIOMFAC_COLUMN):
 
 
 def activity_coefficients(x_exp, g_exp, x_theory, g_theory):
-    """gamma = experimental gradient / theoretical gradient at the same MFS (theory interpolated,
-    no extrapolation). Returns x, gamma, n_outside_range, n_zero_theory."""
     ux, idx = np.unique(x_theory, return_index=True)
     gt = g_theory[idx]
     inside = (x_exp >= ux[0]) & (x_exp <= ux[-1])
@@ -91,7 +86,6 @@ def activity_coefficients(x_exp, g_exp, x_theory, g_theory):
 
 
 def parse_limits(texts):
-    """Blank = automatic. Returns (xmin, xmax, ymin, ymax) with None for automatic; raises ValueError."""
     values = []
     for name, text in zip(("X min", "X max", "Y min", "Y max"), texts):
         text = text.strip()
@@ -166,7 +160,6 @@ LINE_STYLES = {"solid": "-", "dashed": "--", "dash-dot": "-.", "dotted": ":"}
 
 
 def first_line(error):
-    """First non-empty line of an error message (matplotlib maths errors start with a blank line)."""
     text = next((line.strip() for line in str(error).splitlines() if line.strip()), "invalid input")
     if "end_group" in str(error) or "Expected" in str(error):
         text += "  (check that every $...$ and { } in your labels is complete)"
@@ -216,7 +209,6 @@ def auto_axis_limits(series, xscale, yscale):
 
 
 def default_options(series, xlabel, ylabel):
-    """Starting options dict for draw_publication, taken from each series' default style."""
     return dict(
         title="", xlabel=xlabel, ylabel=ylabel, font_size=12, xscale="linear", yscale="log",
         xmin=None, xmax=None, ymin=None, ymax=None, legend=True, grid=False, width=6.5, height=5.0,
@@ -226,7 +218,6 @@ def default_options(series, xlabel, ylabel):
 
 
 def draw_publication(ax, series, o):
-    """Draw all series on ax from the options dict o. Raises ValueError for unusable options."""
     for name, style in o["series"].items():
         if not is_color_like(style["color"]):
             raise ValueError(f"'{style['color']}' is not a valid colour (use a name such as red, or a hex code like #1f77b4).")
@@ -275,8 +266,6 @@ def draw_publication(ax, series, o):
 
 
 class PlotStudio(tk.Toplevel):
-    """Publication-plot editor. Every change in any field redraws the preview immediately."""
-
     def __init__(self, master, series, xlabel, ylabel, filename="figure.png"):
         super().__init__(master)
         self.title("Publication plot")
