@@ -3,7 +3,6 @@ import math
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
@@ -13,6 +12,8 @@ RADIUS_UNCERTAINTY_UM = 0.1
 MAX_ERROR_BARS = 20000  # error bars are thinned to this many; at that density they overlap into a band anyway
 MAX_FIT_BINS = 3000
 DICT_TAUS = np.geomspace(0.003, 30.0, 70)
+
+
 
 
 def read_pair(line):
@@ -194,7 +195,7 @@ MODE_HELP = {
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("EDB radius plotter - monotone convex fit")
+        self.title("EDB Data Plotting (Lawson-Hanson nnls fit)")
         self.geometry("1150x900")
         self.files = []
         self.store = None
