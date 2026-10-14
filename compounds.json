@@ -1,30 +1,42 @@
 {
   "Malonic acid": {
     "density_g_ml": 1.6,
-    "molar_mass_g_mol": 104.061
+    "molar_mass_g_mol": 104.061,
+    "refractive_index": 1.478
   },
   "Tween 20": {
     "density_g_ml": 1.095,
-    "molar_mass_g_mol": 1227.53
+    "molar_mass_g_mol": 1227.53,
+    "refractive_index": 1.468
   },
   "Water": {
     "density_g_ml": 0.997,
-    "molar_mass_g_mol": 18.01528
+    "molar_mass_g_mol": 18.01528,
+    "refractive_index": 1.335
   },
   "3-nitrophenol": {
     "density_g_ml": 1.5,
-    "molar_mass_g_mol": 139.11
+    "molar_mass_g_mol": 139.11,
+    "refractive_index": 1.572
   },
   "Triton X-100": {
     "density_g_ml": 1.07,
-    "molar_mass_g_mol": 636.0
+    "molar_mass_g_mol": 636.0,
+    "refractive_index": 1.468
   },
   "Ethanol": {
     "density_g_ml": 0.789,
-    "molar_mass_g_mol": 46.07
+    "molar_mass_g_mol": 46.07,
+    "refractive_index": 1.368
   },
   "Methylmalonic acid": {
     "density_g_ml": 1.455,
-    "molar_mass_g_mol": 118.09
+    "molar_mass_g_mol": 118.09,
+    "refractive_index": 1.4304
+  },
+  "Glutaric Acid": {
+    "density_g_ml": 1.424,
+    "molar_mass_g_mol": 132.115,
+    "refractive_index": 1.41878
   }
 }

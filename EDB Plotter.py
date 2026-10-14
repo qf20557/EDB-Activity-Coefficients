@@ -4,17 +4,33 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import numpy as np
+from matplotlib import scale
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector, SpanSelector
+import json
 
 RADIUS_UNCERTAINTY_UM = 0.1
 MAX_ERROR_BARS = 20000  # error bars are thinned to this many; at that density they overlap into a band anyway
 MAX_FIT_BINS = 3000
 DICT_TAUS = np.geomspace(0.003, 30.0, 70)
+COMPOUNDS_PATH = Path(__file__).with_name("compounds.json")
+EDB_ASSUMED_RI = 1.335
+MEDIAN_OBS_ANGLE = math.pi*(58.725+31.275)/(2*180)
 
+def load_compounds(path=COMPOUNDS_PATH):
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
 
+def ri_term(angle,ri):
+    h = angle / 2.0
+    return math.cos(h) + ri * math.sin(h) / math.sqrt(1 + ri ** 2 - 2 * ri * math.cos(h))
 
+def correction_factor(new_ri, previous_ri = EDB_ASSUMED_RI, angle = MEDIAN_OBS_ANGLE):
+        return ri_term(angle, previous_ri) / ri_term(angle, new_ri)
 
 def read_pair(line):
     parts = line.replace(",", " ").split()
@@ -71,10 +87,10 @@ class PointStore:
         rows = self.data[self.ids()]
         return rows[:, 0], rows[:, 1]
 
-    def cull_box(self, box, squared, keep_inside=False):
+    def cull_box(self, box, squared, keep_inside=False, scale = 1.0):
         xmin, xmax, ymin, ymax = box
         ids = self.ids()
-        t, r = self.data[ids, 0], self.data[ids, 1]
+        t, r = self.data[ids, 0], self.data[ids, 1] * scale
         y = r * r if squared else r
         inside = (t >= xmin) & (t <= xmax) & (y >= ymin) & (y <= ymax)
         removed = ids[~inside if keep_inside else inside]
@@ -206,6 +222,12 @@ class App(tk.Tk):
             ("x_min", ""), ("x_max", ""), ("y_min", ""), ("y_max", ""))}
         self.squared = tk.BooleanVar(value=False)
         self.use_err = tk.BooleanVar(value=False)
+        self.compounds = load_compounds()
+        self.compound = tk.StringVar(value="")
+        self.n_true = tk.StringVar(value="")
+        self.rho_true = tk.StringVar(value="")
+        self.show_raw = tk.BooleanVar(value=True)
+        self.show_corr = tk.BooleanVar(value=False)
         self.mode = tk.StringVar(value="fit")
         self.status = tk.StringVar(value="Add EDB files in acquisition order, then click Load / plot.")
         self.fit_text = tk.StringVar(value="Fit: none yet.")
@@ -270,6 +292,25 @@ class App(tk.Tk):
             box.pack(side="left", padx=(0, 8))
             box.bind("<Return>", lambda _: self.update_plot())
         ttk.Button(axes, text="Apply axes", command=self.update_plot).pack(side="left")
+        corr = ttk.LabelFrame(top, text="Radius correction (compounds.json)", padding=6)
+        corr.pack(side="left", fill="y", padx=(8, 0))
+        ttk.Label(corr, text="Compound").grid(row=0, column=0, sticky="w")
+        combo = ttk.Combobox(corr, textvariable=self.compound, values=sorted(self.compounds),
+                             state="readonly", width=18)
+        combo.grid(row=0, column=1, sticky="w")
+        combo.bind("<<ComboboxSelected>>", lambda _: self.on_compound())
+        ttk.Label(corr, text="Refractive index").grid(row=1, column=0, sticky="w")
+        ttk.Entry(corr, textvariable=self.n_true, width=10, state="readonly").grid(row=1, column=1, sticky="w")
+        ttk.Label(corr, text="Density (g/mL)").grid(row=2, column=0, sticky="w")
+        ttk.Entry(corr, textvariable=self.rho_true, width=10, state="readonly").grid(row=2, column=1, sticky="w")
+        ttk.Checkbutton(corr, text="Plot raw radius", variable=self.show_raw,
+                        command=lambda: self.update_plot(rescale=True)).grid(row=3, column=0, sticky="w")
+        ttk.Checkbutton(corr, text="Plot corrected radius", variable=self.show_corr,
+                        command=lambda: self.update_plot(rescale=True)).grid(row=3, column=1, sticky="w")
+        self.factor_text = tk.StringVar(value=f"EDB assumed RI {EDB_ASSUMED_RI}; factor 1.0000")
+        ttk.Label(corr, textvariable=self.factor_text).grid(row=4, column=0, columnspan=2, sticky="w")
+
+
 
         act = ttk.Frame(content, padding=(6, 0))
         act.pack(fill="x")
@@ -283,7 +324,7 @@ class App(tk.Tk):
             ttk.Radiobutton(modes, text=text, value=value, variable=self.mode,
                             command=self.set_mode).pack(side="left", padx=6)
         for text, command in (("Undo cull", self.undo_cull), ("Restore all", self.restore_points),
-                              ("Reset zoom", self.reset_zoom), ("Save altered data", self.save_altered)):
+                              ("Reset zoom", self.reset_zoom), ("Save cleaned data", self.save_altered)):
             ttk.Button(modes, text=text, command=command).pack(side="left", padx=3)
 
         ttk.Label(content, textvariable=self.status).pack(anchor="w", padx=8)
@@ -293,7 +334,9 @@ class App(tk.Tk):
         self.axis = self.figure.add_subplot(111)
         self.axis.grid(alpha=0.3)
         self.data_line, = self.axis.plot([], [], linestyle="none", marker="x", markersize=4,
-                                         markeredgewidth=0.8, color="tab:blue", label="Data")
+                                         markeredgewidth=0.8, color="tab:blue", label="Raw")
+        self.corr_line, = self.axis.plot([], [], linestyle="none", marker="x", markersize=4,
+                                         markeredgewidth=0.8, color="tab:green", label="Corrected")
         self.err_bars, = self.axis.plot([], [], color="tab:blue", linewidth=0.6, alpha=0.6, zorder=1)
         self.fit_line, = self.axis.plot([], [], color="tab:red", linewidth=1.8, label="Monotone convex fit")
         self.canvas = FigureCanvasTkAgg(self.figure, master=content)
@@ -362,6 +405,27 @@ class App(tk.Tk):
         self.rect.set_active(mode != "fit")
         self.status.set(MODE_HELP[mode])
 
+    def on_compound(self):
+        info = self.compounds.get(self.compound.get(), {})
+        n, rho = info.get("refractive_index"), info.get("density_g_ml")
+        self.n_true.set("" if n is None else f"{n:g}")
+        self.rho_true.set("" if rho is None else f"{rho:g}")
+        if n is None:
+            self.status.set(f"No refractive_index for {self.compound.get()} in compounds.json; factor = 1.")
+        self.update_plot(rescale=True)
+
+    def factor(self):
+        try:
+            n = float(self.n_true.get())
+            f = correction_factor(n) if n > 0 else 1.0
+        except ValueError:
+            f = 1.0
+        self.factor_text.set(f"EDB assumed RI {EDB_ASSUMED_RI}; factor {f:.4f}")
+        return f
+
+    def fit_scale(self):
+        return self.factor() if self.show_corr.get() else 1.0
+
     def on_span(self, lo, hi):
         if self.store is None or lo == hi:
             return
@@ -381,7 +445,7 @@ class App(tk.Tk):
             self.axis.set_ylim(ymin, ymax)
         elif mode in ("cull", "keep"):
             try:
-                removed = self.store.cull_box((xmin, xmax, ymin, ymax), self.squared.get(), mode == "keep")
+                removed = self.store.cull_box((xmin, xmax, ymin, ymax), self.squared.get(), mode == "keep", self.fit_scale())
             except ValueError as error:
                 messagebox.showinfo("Cull", str(error))
                 removed = 0
@@ -422,21 +486,24 @@ class App(tk.Tk):
             messagebox.showerror("Input selected", "Choose an output file different from the inputs.")
             return
         t, r = self.store.active()
+        factor = self.factor()
+        rc = r * factor
         try:
             with open(path, "w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 if self.use_err.get():
-                    sigma = np.full_like(r, RADIUS_UNCERTAINTY_UM)
-                    writer.writerow(["time_s", "radius_um", "radius_err_um", "radius_squared_um2",
-                                     "radius_squared_err_um2"])
-                    writer.writerows(zip(t, r, sigma, r * r, 2 * r * sigma))
+                    sigma = RADIUS_UNCERTAINTY_UM * factor
+                    writer.writerow(["time_s", "radius_raw_um", "radius_corrected_um",
+                                     "radius_corrected_err_um", "radius_corrected_squared_um2",
+                                     "radius_corrected_squared_err_um2"])
+                    writer.writerows(zip(t, r, rc, np.full_like(rc, sigma), rc * rc, 2 * rc * sigma))
                 else:
-                    writer.writerow(["time_s", "radius_um"])
-                    writer.writerows(zip(t, r))
+                    writer.writerow(["time_s", "radius_raw_um", "radius_corrected_um"])
+                    writer.writerows(zip(t, r, rc))
         except OSError as error:
             messagebox.showerror("Save failed", str(error))
             return
-        self.status.set(f"Saved {len(t):,} retained rows.")
+        self.status.set(f"Saved {len(t):,} retained rows (correction factor {factor:.4f}).")
 
     def number(self, key, label):
         text = self.var[key].get().strip()
@@ -461,7 +528,7 @@ class App(tk.Tk):
             return
         try:
             t, r = self.store.active()
-            self.fit = fit_model(t, r, self.number("fit_lo", "Fit from"), self.number("fit_hi", "Fit to"))
+            self.fit = fit_model(t, r, self.fit_scale(), self.number("fit_lo", "Fit from"), self.number("fit_hi", "Fit to"))
         except ValueError as error:
             self.fit = None
             self.fit_text.set(f"Fit failed: {error}")
@@ -504,8 +571,13 @@ class App(tk.Tk):
         ax = self.axis
         squared = self.squared.get()
         show_err = self.use_err.get()
+        if not (self.show_raw.get() or self.show_corr.get()):
+            self.show_raw.set(True)
+        factor = self.factor()
+        scale = self.fit_scale()
         ax.set_xlabel("Time since first point (s)")
-        ax.set_ylabel("Radius\u00b2 (\u00b5m\u00b2)" if squared else "Radius (\u00b5m)")
+        name = "Corrected radius" if self.show_corr.get() and not self.show_raw.get() else "Radius"
+        ax.set_ylabel(f"{name}\u00b2 (\u00b5m\u00b2)" if squared else f"{name} (\u00b5m)")
         try:
             stride = int(self.var["stride"].get())
             if stride < 1:
@@ -515,24 +587,31 @@ class App(tk.Tk):
             self.status.set("Plot every Nth point must be a positive whole number; using 1.")
         if self.store is not None:
             t, r = self.store.active()
-            y = r * r if squared else r
-            self.data_line.set_data(t[::stride], y[::stride])
+            for line, s, on in ((self.data_line, 1.0, self.show_raw.get()),
+                                (self.corr_line, factor, self.show_corr.get())):
+                if on:
+                    y = (r * s) ** 2 if squared else r * s
+                    line.set_data(t[::stride], y[::stride])
+                else:
+                    line.set_data([], [])
             if show_err:
+                rp = r * scale
+                y = rp * rp if squared else rp
                 step = max(1, len(t[::stride]) // MAX_ERROR_BARS) * stride
-                ts, ys, rs = t[::step], y[::step], r[::step]
-                err = RADIUS_UNCERTAINTY_UM * (2 * rs if squared else np.ones_like(rs))
+                ts, ys, rs = t[::step], y[::step], rp[::step]
+                err = RADIUS_UNCERTAINTY_UM * scale * (2 * rs if squared else np.ones_like(rs))
                 x_bars = np.repeat(ts, 3)
                 y_bars = np.empty(3 * len(ts))
                 y_bars[0::3], y_bars[1::3], y_bars[2::3] = ys - err, ys + err, np.nan
-                x_bars[2::3] = np.nan  # NaN breaks the line, so one Line2D draws every vertical bar
+                x_bars[2::3] = np.nan
                 self.err_bars.set_data(x_bars, y_bars)
             else:
                 self.err_bars.set_data([], [])
             ax.set_title(f"EDB evaporation \u2014 {len(t):,} retained; "
                          f"{len(self.store.data) - len(t):,} culled; {len(t[::stride]):,} plotted")
         else:
-            self.data_line.set_data([], [])
-            self.err_bars.set_data([], [])
+            for line in (self.data_line, self.corr_line, self.err_bars):
+                line.set_data([], [])
         if self.fit_band is not None:
             self.fit_band.remove()
             self.fit_band = None
@@ -541,9 +620,9 @@ class App(tk.Tk):
             self.fit_line.set_data(x, radius2 if squared else radius)
             if show_err:
                 centre = radius2 if squared else radius
-                half = RADIUS_UNCERTAINTY_UM * (2 * radius if squared else 1.0)
-                self.fit_band = ax.fill_between(x, centre - half, centre + half, color="tab:red", alpha=0.25,
-                                                linewidth=0, zorder=2)
+                half = RADIUS_UNCERTAINTY_UM * scale * (2 * radius if squared else 1.0)
+                self.fit_band = ax.fill_between(x, centre - half, centre + half, color="tab:red",
+                                                alpha=0.25, linewidth=0, zorder=2)
         else:
             self.fit_line.set_data([], [])
         if rescale:
@@ -552,9 +631,9 @@ class App(tk.Tk):
             ax.autoscale_view()
         try:
             b = [self.number(k, k.replace("_", " ")) for k in ("x_min", "x_max", "y_min", "y_max")]
-            for low, high, name in ((b[0], b[1], "X"), (b[2], b[3], "Y")):
+            for low, high, nm in ((b[0], b[1], "X"), (b[2], b[3], "Y")):
                 if low is not None and high is not None and low >= high:
-                    raise ValueError(f"{name} min must be below {name} max.")
+                    raise ValueError(f"{nm} min must be below {nm} max.")
             if b[0] is not None or b[1] is not None:
                 left, right = ax.get_xlim()
                 ax.set_xlim(left if b[0] is None else b[0], right if b[1] is None else b[1])
@@ -563,6 +642,7 @@ class App(tk.Tk):
                 ax.set_ylim(bottom if b[2] is None else b[2], top if b[3] is None else b[3])
         except ValueError as error:
             self.status.set(f"Axis limits ignored: {error}")
+        ax.legend(loc="best", fontsize=8)
         self.canvas.draw_idle()
 
 
