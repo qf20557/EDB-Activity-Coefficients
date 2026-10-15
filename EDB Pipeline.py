@@ -1310,6 +1310,7 @@ class MfsStage(ttk.Frame):
         r0.grid(row=4, column=0, columnspan=6, sticky="w")
         ttk.Button(r0, text="r₀ = first EDB point", command=self.r0_from_edb).pack(side="left", padx=2)
         ttk.Button(r0, text="r₀ = fit at start", command=self.r0_from_fit).pack(side="left", padx=2)
+        ttk.Button(r0, text="r₀ from dry radius", command=self.r0_from_dry).pack(side="left", padx=2)
         ttk.Label(r0, text="Uncertainty (corrected radius, 0 = off) shifts the whole fit and r₀ down / up together; "
                            "the spread gives the error bars in stage 3.", foreground="#555").pack(side="left", padx=8)
 
@@ -1469,6 +1470,29 @@ class MfsStage(ttk.Frame):
             return
         self.v["Initial radius (um)"].set(f"{math.sqrt(self.r2[0]):.8g}")
         self.update_model()
+
+    def r0_from_dry(self):
+        """Effective r0 that makes the fitted radius at the interval start the dry (A+B) radius."""
+        if self.t is None:
+            messagebox.showinfo("No fit", "No fit loaded.", parent=self)
+            return
+        try:
+            start = self.num("Interval start (s)", "Interval start")
+            a = self.app.compounds[self.get("A: evaporating")]
+            b = self.app.compounds[self.get("B: conserved")]
+            s = self.app.compounds[self.get("Solvent")]
+            v_a = self.num("massA: evaporating", "Mass A") / a["density_g_ml"]
+            v_b = self.num("massB: conserved", "Mass B") / b["density_g_ml"]
+            v_s = self.num("massSolvent", "Solvent mass") / s["density_g_ml"]
+        except (ValueError, KeyError) as error:
+            messagebox.showerror("Dry-radius anchor", str(error), parent=self)
+            return
+        r_dry = math.sqrt(np.interp(start, self.t, self.r2))
+        r0 = r_dry * ((v_a + v_b + v_s) / (v_a + v_b)) ** (1 / 3)
+        self.v["Initial radius (um)"].set(f"{r0:.8g}")
+        self.update_model()
+        self.status.set(f"r0 set to {r0:.6g} um so the fit radius at {start:g} s ({r_dry:.6g} um) "
+                        "is the dry A+B radius.")
 
     def update_model(self, rescale=False):
         self.mfs = self.mfs_minus = self.mfs_plus = None
