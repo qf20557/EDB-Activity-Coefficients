@@ -36,6 +36,7 @@ LIMIT_KEYS = (("X min (s)", "x_min"), ("X max (s)", "x_max"), ("Y min", "y_min")
 
 # Stage 3 (EDB Activity Coefficients)
 AIOMFAC_COLUMN = "a_x"
+AIOMFAC_DIR = Path(__file__).resolve().with_name("AIOMFAC simulations")
 SAVE_DPI = 1200
 matplotlib.rcParams["savefig.dpi"] = SAVE_DPI  # every save (including toolbar save buttons) is 1200 dpi
 COLOURS = ("black", "red", "blue", "green", "orange", "purple", "grey", "brown", "teal", "magenta")
@@ -523,6 +524,13 @@ def parse_aiomfac(path):
     if not tables:
         raise ValueError("No component tables found. Is this an AIOMFAC-web output file?")
     return tables
+
+
+def aiomfac_simulations(folder=AIOMFAC_DIR):
+    """Relative paths of every AIOMFAC output file in the repo's simulations folder (subfolders included)."""
+    if not folder.is_dir():
+        return []
+    return sorted((p.relative_to(folder).as_posix() for p in folder.rglob("*.txt")), key=str.lower)
 
 
 def aiomfac_curve(tables, component, quantity=AIOMFAC_COLUMN):
@@ -1835,12 +1843,20 @@ class ActivityStage(ttk.Frame):
         bar = ttk.Frame(root)
         bar.pack(fill="x", padx=4, pady=4)
         for text, command in (("Load theoretical CSV", self.load_theory),
-                              ("Load AIOMFAC file", self.load_aiomfac),
                               ("Load experimental CSV (override)", self.load_experiment),
                               ("Export activity coefficients CSV", self.export),
                               ("Publication plot...", self.open_studio)):
             ttk.Button(bar, text=text, command=command).pack(side="left", padx=2)
         ttk.Label(root, textvariable=self.source, foreground="#555", wraplength=950).pack(anchor="w", padx=6)
+
+        sim = ttk.Frame(root)
+        sim.pack(fill="x", padx=4, pady=(3, 0))
+        ttk.Label(sim, text="AIOMFAC simulation").pack(side="left", padx=(2, 3))
+        self.simulation = tk.StringVar()
+        self.simulation_box = ttk.Combobox(sim, textvariable=self.simulation, width=70, state="readonly",
+                                           values=aiomfac_simulations(), postcommand=self.list_simulations)
+        self.simulation_box.pack(side="left")
+        self.simulation_box.bind("<<ComboboxSelected>>", lambda _: self.load_aiomfac())
 
         opts = ttk.Frame(root)
         opts.pack(fill="x", padx=4)
@@ -1890,7 +1906,7 @@ class ActivityStage(ttk.Frame):
     def receive(self, experiment):
         self.experiment = experiment
         self.source.set(f"Experimental data: {len(experiment[0])} interval(s) from stage 2"
-                        f"{self.uncertainty_note()}. Load your theoretical (DropletLab) CSV and AIOMFAC file.")
+                        f"{self.uncertainty_note()}. Load your theoretical (DropletLab) CSV and choose an AIOMFAC simulation.")
         self.refresh()
 
     def pick(self, title, types):
@@ -1915,10 +1931,13 @@ class ActivityStage(ttk.Frame):
             return ", no radius-uncertainty columns (no error bars)"
         return ", with radius-uncertainty columns (error bars)"
 
+    def list_simulations(self):
+        self.simulation_box["values"] = aiomfac_simulations()
+
     def load_aiomfac(self):
-        path = self.pick("AIOMFAC output file", [("Text", "*.txt"), ("All files", "*")])
-        if path:
-            self.safe(lambda: self.set_tables(parse_aiomfac(path)))
+        name = self.simulation.get()
+        if name:
+            self.safe(lambda: self.set_tables(parse_aiomfac(AIOMFAC_DIR / name)))
 
     def set_tables(self, tables):
         self.tables = tables
@@ -1983,7 +2002,7 @@ class ActivityStage(ttk.Frame):
             except Exception as error:
                 notes.append(str(error))
         if not notes:
-            notes.append("Load the theoretical CSV and the AIOMFAC output file.")
+            notes.append("Load the theoretical CSV and choose an AIOMFAC simulation.")
         try:
             limits = parse_limits([var.get() for var in self.limit_vars], positive_y=True)
         except ValueError as error:

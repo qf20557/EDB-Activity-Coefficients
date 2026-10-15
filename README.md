@@ -3,33 +3,17 @@ An analysis pipeline to convert EDB evaporation data to aerosol activity coeffic
 
 READ FIRST:
 1. check compounds.json and make sure every chemical you are working with is in there
-2. Open EDB Solutions if you need to create a sample vial to levitate within the EDB
-3. Open 'EDB Plotter.py'
-	Add EDB Files - plot r2, plot every 1th point, select monotone convex fit
-	click 'Load/Plot'
-	process plot using Cull and Zoom, drawing boxes on the plot to select the region
-	click 'Save altered data'
-	click 'Fit'
-	Export fit CSV, title appropriately and save
-4. Open 'EDB Fit Processing.py'
-	select the correct compound in A,B and Solvent
-	input the masses in amounts made up into the solution vial
-	load the fit CSV from part 2
-	load the cleaned EDB CSV from part 2
-	interval start ~5s
-	plot every 1th point
-	set axis limits
-	click 'Apply'
-	set bin width for data binning
-	click 'Calculate intervals'
-	click 'Export CSV', name appropriately and save
-5. Open 'EDB Activity Coefficients.py'
-	load theoretical CSV (DropletLab simulation)
-	load experimental CSV from part 3
-	load AIOMFAC file
-	change label to whatever compound abbreviation you want
-	change axes
-	click 'Export activity coefficients CSV'
-	click 'Publication plot...'
-	customise and save
+2. add all relevant AIOMFAC web output files to the 'AIOMFAC simulations' folder
+3. Open EDB Pipeline.py
+4. Load in raw EDB or CSV data, clean and fit using the cull and fit buttons.
+5. Save cleaned EDB data and fit CSV to a directory of your choice
+6. Proceed to the second stage
+7. Set up the droplet vial formulation in the above boxes (everything in compounds.json should be there)
+8. Set bin size and apply to plot
+9. Export binned data
+10. Proceed to the third stage
+11. Upload all relevant data (binned gradients from stage 2, and an ideal evaporation plot from your own simulation)
+12. Choose the relevant AIOMFAC file from the dropdown menu
+13. Customise publication style plot
+14. Save to your device!
 	
