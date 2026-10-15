@@ -1057,7 +1057,7 @@ class CleanFitStage(ttk.Frame):
         if self.require_correction("saving") is None:
             return
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
-                                            initialfile="edb_cleaned.csv", parent=self)
+                                            initialfile="Cleaned EDB Data.csv", parent=self)
         if not path:
             return
         if any(Path(path).exists() and Path(path).samefile(p) for p in self.files):
@@ -1128,7 +1128,7 @@ class CleanFitStage(ttk.Frame):
             messagebox.showerror("Fit error", f"Could not fit the corrected radius: {error}", parent=self)
             return
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
-                                            initialfile="edb_fit.csv", parent=self)
+                                            initialfile="Fitted EDB Data.csv", parent=self)
         if not path:
             return
         try:
@@ -1621,7 +1621,7 @@ class MfsStage(ttk.Frame):
             messagebox.showinfo("Nothing to export", "Calculate intervals first.", parent=self)
             return
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
-                                            initialfile="edb_intervals.csv", parent=self)
+                                            initialfile="Experimental Data.csv", parent=self)
         if not path:
             return
         try:
