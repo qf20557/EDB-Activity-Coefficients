@@ -28,7 +28,10 @@ MEDIAN_OBS_ANGLE = math.pi * (58.725 + 31.275) / (2 * 180)
 # Stage 2 (EDB Fit Processing)
 MIN_POINTS = 3
 MAX_BINS = 20000
-CSV_COLUMNS = ["Average MFS", "Gradient (um2/s)"]
+# columns 3-6: the same quantities with the whole radius trace (fit and initial radius) shifted down / up by the
+# radius uncertainty; stage 3 turns these into error bars
+CSV_COLUMNS = ["Average MFS", "Gradient (um2/s)", "Average MFS (radius - unc)", "Gradient (radius - unc) (um2/s)",
+               "Average MFS (radius + unc)", "Gradient (radius + unc) (um2/s)"]
 LIMIT_KEYS = (("X min (s)", "x_min"), ("X max (s)", "x_max"), ("Y min", "y_min"), ("Y max", "y_max"))
 
 # Stage 3 (EDB Activity Coefficients)
@@ -308,21 +311,45 @@ MODE_HELP = {
 # Stage 2 maths: MFS model and binned gradients
 # ----------------------------------------------------------------------------------------------------------------
 
+def csv_uncertainty(df, cols, err_col, factor_col=None, raw_col=None, value_col=None):
+    """Corrected-radius uncertainty (um) stored in a stage 1 CSV: the error column if present, otherwise
+    RADIUS_UNCERTAINTY_UM times the correction factor (stored, or corrected / raw). None if neither is there."""
+    def first(col):
+        values = pd.to_numeric(df[cols[col]], errors="coerce").to_numpy(float)
+        values = values[np.isfinite(values) & (values > 0)]
+        return float(np.median(values)) if values.size else None
+    if err_col in cols:
+        return first(err_col)
+    if factor_col in cols:
+        factor = first(factor_col)
+        return None if factor is None else RADIUS_UNCERTAINTY_UM * factor
+    if raw_col in cols and value_col in cols:
+        raw = pd.to_numeric(df[cols[raw_col]], errors="coerce").to_numpy(float)
+        corrected = pd.to_numeric(df[cols[value_col]], errors="coerce").to_numpy(float)
+        ratio = corrected / raw
+        ratio = ratio[np.isfinite(ratio) & (ratio > 0)]
+        return RADIUS_UNCERTAINTY_UM * float(np.median(ratio)) if ratio.size else None
+    return None
+
+
 def read_fit_csv(path):
-    """Return time (s) and fitted radius squared (um^2) from the fit CSV."""
+    """Return time (s), fitted corrected radius squared (um^2) and the radius uncertainty (um, or None) from a
+    fit CSV exported by stage 1. Fits without a corrected-radius column are refused."""
     df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
-    cols = {c.strip().lower(): c for c in df.columns}
-    time_col = cols.get("time_s", df.columns[0])
-    if "fitted_radius_squared_um2" in cols:
-        r2 = pd.to_numeric(df[cols["fitted_radius_squared_um2"]], errors="coerce")
-    elif "fitted_radius_um" in cols:
-        r2 = pd.to_numeric(df[cols["fitted_radius_um"]], errors="coerce") ** 2
-    elif df.shape[1] >= 3:
-        r2 = pd.to_numeric(df.iloc[:, 2], errors="coerce")
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    if "time_s" not in cols:
+        raise ValueError("This file has no 'time_s' column. Load a fit CSV exported by stage 1.")
+    if "fitted_radius_corrected_squared_um2" in cols:
+        r2 = pd.to_numeric(df[cols["fitted_radius_corrected_squared_um2"]], errors="coerce")
+    elif "fitted_radius_corrected_um" in cols:
+        r2 = pd.to_numeric(df[cols["fitted_radius_corrected_um"]], errors="coerce") ** 2
     else:
-        raise ValueError("Could not find the fitted radius squared column.")
-    t = pd.to_numeric(df[time_col], errors="coerce")
-    return clean_fit_arrays(t.to_numpy(float), r2.to_numpy(float))
+        raise ValueError("This fit CSV has no corrected radius column ('fitted_radius_corrected_um'). It was "
+                         "probably exported by an older version, on the raw radius. Re-export the fit from "
+                         "stage 1 with a compound selected.")
+    t = pd.to_numeric(df[cols["time_s"]], errors="coerce")
+    sigma = csv_uncertainty(df, cols, "fitted_radius_corrected_err_um", "radius_correction_factor")
+    return (*clean_fit_arrays(t.to_numpy(float), r2.to_numpy(float)), sigma)
 
 
 def clean_fit_arrays(t, r2):
@@ -339,18 +366,20 @@ def clean_fit_arrays(t, r2):
 
 
 def read_edb_csv(path):
-    """Cleaned EDB CSV: column 1 = time, column 2 = radius (radius_raw_um in files saved by stage 1)."""
-    with open(path, encoding="utf-8-sig", errors="replace") as handle:
-        sample = "".join(handle.readline() for _ in range(5))
-    sep = "," if "," in sample else r"\s+"
-    df = pd.read_csv(path, sep=sep, header=None, usecols=[0, 1], dtype=str, encoding="utf-8-sig",
-                     encoding_errors="replace", on_bad_lines="skip")
-    t = pd.to_numeric(df.iloc[:, 0], errors="coerce").to_numpy(float)
-    r = pd.to_numeric(df.iloc[:, 1], errors="coerce").to_numpy(float)
+    """Cleaned EDB CSV saved by stage 1: time_s and radius_corrected_um (header required)."""
+    df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    if "time_s" not in cols or "radius_corrected_um" not in cols:
+        raise ValueError("This file has no 'time_s' and 'radius_corrected_um' columns. Load a cleaned CSV saved by "
+                         "stage 1 ('Save cleaned data'), not a raw EDB file.")
+    t = pd.to_numeric(df[cols["time_s"]], errors="coerce").to_numpy(float)
+    r = pd.to_numeric(df[cols["radius_corrected_um"]], errors="coerce").to_numpy(float)
     good = np.isfinite(t) & np.isfinite(r) & (r > 0)
     if not good.any():
-        raise ValueError("No valid time/radius rows found in the EDB file.")
-    return t[good], r[good]
+        raise ValueError("No valid time / corrected radius rows found in the cleaned CSV.")
+    sigma = csv_uncertainty(df, cols, "radius_corrected_err_um", raw_col="radius_raw_um",
+                            value_col="radius_corrected_um")
+    return t[good], r[good], sigma
 
 
 def make_mfs_function(records, name_a, name_b, name_s, mass_a, mass_b, mass_s, r0):
@@ -392,21 +421,30 @@ def bin_edges(lo, hi, width):
     return np.r_[np.arange(lo, hi, width), hi]
 
 
-def interval_results(t, r2, mfs, lo, hi, width):
-    x_all = mfs(r2)
+def interval_results(t, scenarios, lo, hi, width):
+    """scenarios: [(r2, mfs), ...], nominal first (then radius - uncertainty, radius + uncertainty). Each row holds
+    (average MFS, gradient) for every scenario in turn. A bin is skipped when the nominal scenario is invalid there;
+    another scenario that is invalid in a kept bin gives NaN for that bin."""
+    x_all = [mfs(r2) for r2, mfs in scenarios]
     edges = bin_edges(lo, hi, width)
     rows, skipped = [], 0
     for j, (a, b) in enumerate(zip(edges[:-1], edges[1:])):
         last = j == len(edges) - 2
         mask = (t >= a) & ((t <= b) if last else (t < b))
-        tt, yy, xx = t[mask], r2[mask], x_all[mask]
-        if len(tt) < MIN_POINTS or np.any(~np.isfinite(xx)):
+        tt = t[mask]
+        if len(tt) < MIN_POINTS or np.any(~np.isfinite(x_all[0][mask])):
             skipped += 1
             continue
         span = tt[-1] - tt[0]
-        average = float(np.sum(0.5 * (xx[1:] + xx[:-1]) * np.diff(tt)) / span)
-        slope = float(np.polyfit(tt - tt.mean(), yy, 1)[0])
-        rows.append((average, slope))
+        row = []
+        for (r2, _), x in zip(scenarios, x_all):
+            yy, xx = r2[mask], x[mask]
+            if np.all(np.isfinite(xx)) and np.all(np.isfinite(yy)):
+                row += [float(np.sum(0.5 * (xx[1:] + xx[:-1]) * np.diff(tt)) / span),
+                        float(np.polyfit(tt - tt.mean(), yy, 1)[0])]
+            else:
+                row += [math.nan, math.nan]
+        rows.append(tuple(row))
     return rows, skipped
 
 
@@ -432,22 +470,29 @@ def apply_limits(ax, lo, hi, which):
 # Stage 3 maths: activity coefficients and AIOMFAC
 # ----------------------------------------------------------------------------------------------------------------
 
-def sort_mfs_gradient(x, g):
+def sort_mfs_gradient(x, g, extra=None):
+    """Sort by MFS. extra: optional (n, 4) array of (MFS, gradient) at radius - / + uncertainty, kept aligned."""
     x, g = np.asarray(x, dtype=float), np.asarray(g, dtype=float)
     good = np.isfinite(x) & np.isfinite(g)
     if not good.any():
         raise ValueError("No numeric rows found.")
     order = np.argsort(x[good], kind="stable")
-    return x[good][order], g[good][order]
+    if extra is not None:
+        extra = np.asarray(extra, dtype=float).reshape(len(x), 4)[good][order]
+    return x[good][order], g[good][order], extra
 
 
 def read_mfs_gradient(path):
+    """(MFS, gradient, extra). extra holds the uncertainty columns of a stage 2 export, or None."""
     df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
     if df.shape[1] < 2:
         raise ValueError("The CSV needs two columns: Average MFS and Gradient.")
     x = pd.to_numeric(df.iloc[:, 0], errors="coerce").to_numpy(float)
     g = pd.to_numeric(df.iloc[:, 1], errors="coerce").to_numpy(float)
-    return sort_mfs_gradient(x, g)
+    extra = None
+    if [str(c).strip() for c in df.columns[2:6]] == CSV_COLUMNS[2:]:
+        extra = df.iloc[:, 2:6].apply(pd.to_numeric, errors="coerce").to_numpy(float)
+    return sort_mfs_gradient(x, g, extra)
 
 
 def parse_aiomfac(path):
@@ -499,19 +544,59 @@ def aiomfac_curve(tables, component, quantity=AIOMFAC_COLUMN):
     return x[order], y[order], flagged
 
 
-def activity_coefficients(x_exp, g_exp, x_theory, g_theory):
+def activity_coefficients(x_exp, g_exp, x_theory, g_theory, extra=None):
+    """gamma = experimental / theoretical gradient at the same MFS. With extra (see sort_mfs_gradient) each shifted
+    (MFS, gradient) pair gives its own gamma; bounds = (x_lo, x_hi, gamma_lo, gamma_hi) span the nominal value and
+    both shifted values (a shifted gamma outside the theoretical range is left out, so that bar is truncated)."""
     ux, idx = np.unique(x_theory, return_index=True)
     gt = g_theory[idx]
-    inside = (x_exp >= ux[0]) & (x_exp <= ux[-1])
-    theory_at = np.full(len(x_exp), np.nan)
-    theory_at[inside] = np.interp(x_exp[inside], ux, gt)
-    nonzero = np.abs(np.nan_to_num(theory_at)) > 1e-12 * max(np.abs(gt).max(), 1e-300)
+    tiny = 1e-12 * max(np.abs(gt).max(), 1e-300)
+
+    def theory_at(x):
+        inside = (x >= ux[0]) & (x <= ux[-1])
+        value = np.full(len(x), np.nan)
+        value[inside] = np.interp(x[inside], ux, gt)
+        return inside, value
+
+    inside, theory = theory_at(x_exp)
+    nonzero = np.abs(np.nan_to_num(theory)) > tiny
     good = inside & nonzero
-    return x_exp[good], g_exp[good] / theory_at[good], int((~inside).sum()), int((inside & ~nonzero).sum())
+    x, gamma = x_exp[good], g_exp[good] / theory[good]
+    bounds, truncated = None, 0
+    if extra is not None:
+        xs, gammas = [x], [gamma]
+        for xe, ge in ((extra[good, 0], extra[good, 1]), (extra[good, 2], extra[good, 3])):
+            ok, th = theory_at(xe)
+            ok &= np.abs(np.nan_to_num(th)) > tiny
+            with np.errstate(divide="ignore", invalid="ignore"):
+                gammas.append(np.where(ok & np.isfinite(ge), ge / th, np.nan))
+            xs.append(xe)
+            truncated |= ~np.isfinite(gammas[-1])
+        xs, gammas = np.vstack(xs), np.vstack(gammas)
+        bounds = (np.nanmin(xs, 0), np.nanmax(xs, 0), np.nanmin(gammas, 0), np.nanmax(gammas, 0))
+        truncated = int(np.sum(truncated))
+        if not any(np.any(hi > lo) for lo, hi in (bounds[:2], bounds[2:])):
+            bounds = None  # zero uncertainty
+    return x, gamma, int((~inside).sum()), int((inside & ~nonzero).sum()), bounds, truncated
 
 
-def draw_activity(ax, label, points=None, curve=None, limits=None):
+def error_bars(ax, x, y, bounds, keep, color, show_x=True, show_y=True, zorder=3):
+    """Asymmetric error bars from bounds = (x_lo, x_hi, y_lo, y_hi) for the points selected by keep."""
+    if not (show_x or show_y):
+        return
+    x_lo, x_hi, y_lo, y_hi = (np.asarray(b, dtype=float)[keep] for b in bounds)
+    x, y = np.asarray(x, dtype=float)[keep], np.asarray(y, dtype=float)[keep]
+    ax.errorbar(x, y, xerr=[x - x_lo, x_hi - x] if show_x else None, yerr=[y - y_lo, y_hi - y] if show_y else None,
+                fmt="none", ecolor=color, elinewidth=0.8, capsize=2, zorder=zorder)
+
+
+def draw_activity(ax, label, points=None, curve=None, limits=None, bounds=None, show_x=True, show_y=True):
     ax.clear()
+    if bounds is not None:
+        # hidden bars do not widen the automatic limits either
+        x_lo, x_hi, y_lo, y_hi = bounds
+        x, y = points
+        bounds = (x_lo if show_x else x, x_hi if show_x else x, y_lo if show_y else y, y_hi if show_y else y)
     ax.set_yscale("log")
     ax.set_xlabel(rf"$x_{{\mathrm{{{label}}}}}$", fontsize=14)
     ax.set_ylabel(rf"$\gamma_{{\mathrm{{{label}}}}}$", fontsize=14)
@@ -523,8 +608,12 @@ def draw_activity(ax, label, points=None, curve=None, limits=None):
         keep = points[1] > 0
         ax.plot(points[0][keep], points[1][keep], "s", color="black", markersize=5, linestyle="none",
                 label="Experiment")
+        if bounds is not None:
+            error_bars(ax, *points, bounds, keep, "black", show_x, show_y)
     if has_points:
         lo, hi = points[0].min(), points[0].max()
+        if bounds is not None:
+            lo, hi = min(lo, np.nanmin(bounds[0])), max(hi, np.nanmax(bounds[1]))
         pad = 0.05 * max(hi - lo, 0.02)
         xlim = (lo - pad, hi + pad)
     elif curve is not None:
@@ -539,6 +628,8 @@ def draw_activity(ax, label, points=None, curve=None, limits=None):
             values.append(curve[1][inside])
         if has_points:
             values.append(points[1][points[1] > 0])
+            if bounds is not None:
+                values += [bounds[2], bounds[3]]
     values = [v[np.isfinite(v) & (v > 0)] for v in values]
     values = np.concatenate(values) if values else np.array([])
     if values.size:
@@ -561,15 +652,19 @@ def _has_data(series):
     return series.get("x") is not None and len(series["x"]) > 0
 
 
-def auto_axis_limits(series, xscale, yscale):
-    """Default (xlim, ylim) from the data. Point series set the x range; lines only if there are no points."""
+def auto_axis_limits(series, xscale, yscale, xerr=True, yerr=True):
+    """Default (xlim, ylim) from the data. Point series set the x range; lines only if there are no points.
+    Shown error bars (xerr / yerr) are included in the range."""
     series = [s for s in series if _has_data(s)]
     points = [s for s in series if s["kind"] == "points"]
     lines = [s for s in series if s["kind"] == "line"]
     source = points or lines
     if not source:
         return None, None
-    xs = np.concatenate([np.asarray(s["x"], dtype=float) for s in source])
+    xs = [np.asarray(s["x"], dtype=float) for s in source]
+    if xerr:
+        xs += [np.asarray(b, dtype=float) for s in points if s.get("bounds") is not None for b in s["bounds"][:2]]
+    xs = np.concatenate(xs)
     xs = xs[np.isfinite(xs)]
     if xscale == "log":
         xs = xs[xs > 0]
@@ -587,6 +682,8 @@ def auto_axis_limits(series, xscale, yscale):
         values.append(y[(x >= xlim[0]) & (x <= xlim[1])])
     for s in points:
         values.append(np.asarray(s["y"], dtype=float))
+        if yerr and s.get("bounds") is not None:
+            values += [np.asarray(b, dtype=float) for b in s["bounds"][2:]]
     values = np.concatenate(values) if values else np.array([])
     values = values[np.isfinite(values)]
     if yscale == "log":
@@ -623,7 +720,10 @@ def draw_publication(ax, series, o):
             else:
                 ax.plot(s["x"], s["y"], st["marker"], color=st["color"], markersize=st["size"], linestyle="none",
                         label=st["label"], zorder=3)
-    xlim, ylim = auto_axis_limits(series, o["xscale"], o["yscale"])
+                if s.get("bounds") is not None:
+                    keep = np.asarray(s["y"], dtype=float) > 0 if o["yscale"] == "log" else slice(None)
+                    error_bars(ax, s["x"], s["y"], s["bounds"], keep, st["color"], o["xerr"], o["yerr"])
+    xlim, ylim = auto_axis_limits(series, o["xscale"], o["yscale"], o["xerr"], o["yerr"])
     if xlim:
         ax.set_xlim(*xlim)
     if ylim:
@@ -725,7 +825,8 @@ class CleanFitStage(ttk.Frame):
                         command=self.on_basis_change).grid(row=3, column=1, sticky="w")
         self.factor_text = tk.StringVar(value=f"EDB assumed RI {EDB_ASSUMED_RI}; factor 1.0000")
         ttk.Label(corr, textvariable=self.factor_text).grid(row=4, column=0, columnspan=2, sticky="w")
-        ttk.Label(corr, text="Fit and stage 2 use the corrected\nradius when it is plotted.",
+        ttk.Label(corr, text="The displayed fit follows the plotted radius;\nstage 2 and exported fits always use\n"
+                             "the corrected radius.",
                   foreground="#555").grid(row=5, column=0, columnspan=2, sticky="w")
 
         act = ttk.Frame(content, padding=(6, 0))
@@ -862,6 +963,30 @@ class CleanFitStage(ttk.Frame):
     def fit_scale(self):
         return self.factor() if self.show_corr.get() else 1.0
 
+    def require_correction(self, action):
+        """Correction factor for outputs that must be on the corrected radius, or None if the user backs out."""
+        name = self.compound.get()
+        if name not in self.app.compounds:
+            messagebox.showinfo("No compound", f"Choose the droplet compound (radius correction) before {action}: "
+                                "stage 2 and the exported files always use the corrected radius.", parent=self)
+            return None
+        if self.app.compounds[name].get("refractive_index") is None and not messagebox.askyesno(
+                "No refractive index", f"{name} has no refractive_index in compounds.json, so the corrected "
+                "radius equals the raw radius (factor 1). Continue?", parent=self):
+            return None
+        return self.factor()
+
+    def corrected_fit(self):
+        """The current fit on the corrected radius: the displayed fit if it already is, otherwise a refit of the
+        same retained points over the same time window."""
+        factor = self.factor()
+        if self.fit["scale"] == factor:
+            return self.fit
+        t, r = self.store.active()
+        fit = fit_model(t, r * factor, self.fit["lo"], self.fit["hi"])
+        fit["scale"] = factor
+        return fit
+
     # plot interaction
     def on_span(self, lo, hi):
         if self.store is None or lo == hi:
@@ -920,6 +1045,8 @@ class CleanFitStage(ttk.Frame):
     def save_altered(self):
         if self.store is None:
             messagebox.showinfo("No data", "Load data first.", parent=self)
+            return
+        if self.require_correction("saving") is None:
             return
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
                                             initialfile="edb_cleaned.csv", parent=self)
@@ -985,36 +1112,43 @@ class CleanFitStage(ttk.Frame):
         if self.fit is None:
             messagebox.showinfo("No fit", "Run a fit first.", parent=self)
             return
+        if self.require_correction("exporting the fit") is None:
+            return
+        try:
+            fit = self.corrected_fit()
+        except ValueError as error:
+            messagebox.showerror("Fit error", f"Could not fit the corrected radius: {error}", parent=self)
+            return
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
                                             initialfile="edb_fit.csv", parent=self)
         if not path:
             return
         try:
-            self.write_fit(path)
+            self.write_fit(path, fit)
         except OSError as error:
             messagebox.showerror("Export error", str(error), parent=self)
             return
-        self.status.set(f"Fit exported ({FIT_EXPORT_POINTS} points).")
+        self.status.set(f"Corrected-radius fit exported ({FIT_EXPORT_POINTS} points, factor {fit['scale']:.4f}).")
 
-    def write_fit(self, path):
-        x, radius, radius2 = fit_curve(self.fit, FIT_EXPORT_POINTS)
+    def write_fit(self, path, fit):
+        x, radius, radius2 = fit_curve(fit, FIT_EXPORT_POINTS)
+        header = ["time_s", "fitted_radius_corrected_um", "fitted_radius_corrected_squared_um2",
+                  "radius_correction_factor"]
+        columns = [x, radius, radius2, np.full_like(x, fit["scale"])]
+        if self.use_err.get():
+            sigma = RADIUS_UNCERTAINTY_UM * fit["scale"]
+            header += ["fitted_radius_corrected_err_um", "fitted_radius_corrected_lower_um",
+                       "fitted_radius_corrected_upper_um", "fitted_radius_corrected_squared_err_um2",
+                       "fitted_radius_corrected_squared_lower_um2", "fitted_radius_corrected_squared_upper_um2"]
+            columns += [np.full_like(radius, sigma), radius - sigma, radius + sigma, 2 * radius * sigma,
+                        (radius - sigma) ** 2, (radius + sigma) ** 2]
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            if self.use_err.get():
-                sigma = RADIUS_UNCERTAINTY_UM * self.fit["scale"]
-                sigma2 = 2 * radius * sigma
-                writer.writerow(["time_s", "fitted_radius_um", "fitted_radius_err_um",
-                                 "fitted_radius_lower_um", "fitted_radius_upper_um",
-                                 "fitted_radius_squared_um2", "fitted_radius_squared_err_um2",
-                                 "fitted_radius_squared_lower_um2", "fitted_radius_squared_upper_um2"])
-                writer.writerows(zip(x, radius, np.full_like(radius, sigma), radius - sigma, radius + sigma,
-                                     radius2, sigma2, radius2 - sigma2, radius2 + sigma2))
-            else:
-                writer.writerow(["time_s", "fitted_radius_um", "fitted_radius_squared_um2"])
-                writer.writerows(zip(x, radius, radius2))
+            writer.writerow(header)
+            writer.writerows(zip(*columns))
 
     def handoff(self):
-        """Data for stage 2: cleaned points and fit, both on the radius basis used for the fit."""
+        """Data for stage 2: cleaned points and fit, both always on the corrected radius."""
         if self.store is None:
             messagebox.showinfo("No data", "Load EDB data first.", parent=self)
             return None
@@ -1022,11 +1156,18 @@ class CleanFitStage(ttk.Frame):
             messagebox.showinfo("No fit", "Fit the data before moving on (click Fit or drag a fit region).",
                                 parent=self)
             return None
-        scale = self.fit["scale"]
+        factor = self.require_correction("moving on")
+        if factor is None:
+            return None
+        try:
+            fit = self.corrected_fit()
+        except ValueError as error:
+            messagebox.showerror("Fit error", f"Could not fit the corrected radius: {error}", parent=self)
+            return None
         t, r = self.store.active()
-        x, _, radius2 = fit_curve(self.fit, FIT_EXPORT_POINTS)
-        return dict(edb_t=t.copy(), edb_r=r * scale, fit_t=x, fit_r2=radius2,
-                    basis="corrected" if scale != 1.0 else "raw", factor=scale)
+        x, _, radius2 = fit_curve(fit, FIT_EXPORT_POINTS)
+        return dict(edb_t=t.copy(), edb_r=r * factor, fit_t=x, fit_r2=radius2, factor=factor,
+                    sigma=RADIUS_UNCERTAINTY_UM * factor, refitted=fit is not self.fit)
 
     def update_plot(self, rescale=False):
         ax = self.axis
@@ -1056,14 +1197,15 @@ class CleanFitStage(ttk.Frame):
                 else:
                     line.set_data([], [])
             if show_err:
-                rp = r * scale
-                y = rp * rp if squared else rp
                 step = max(1, len(t[::stride]) // MAX_ERROR_BARS) * stride
-                ts, ys, rs = t[::step], y[::step], rp[::step]
-                err = RADIUS_UNCERTAINTY_UM * scale * (2 * rs if squared else np.ones_like(rs))
+                ts, rs = t[::step], r[::step] * scale
+                sigma = RADIUS_UNCERTAINTY_UM * scale
+                lower, upper = np.clip(rs - sigma, 0, None), rs + sigma
+                if squared:
+                    lower, upper = lower ** 2, upper ** 2
                 x_bars = np.repeat(ts, 3)
                 y_bars = np.empty(3 * len(ts))
-                y_bars[0::3], y_bars[1::3], y_bars[2::3] = ys - err, ys + err, np.nan
+                y_bars[0::3], y_bars[1::3], y_bars[2::3] = lower, upper, np.nan
                 x_bars[2::3] = np.nan
                 self.err_bars.set_data(x_bars, y_bars)
             else:
@@ -1080,10 +1222,11 @@ class CleanFitStage(ttk.Frame):
             x, radius, radius2 = fit_curve(self.fit)
             self.fit_line.set_data(x, radius2 if squared else radius)
             if show_err:
-                centre = radius2 if squared else radius
-                half = RADIUS_UNCERTAINTY_UM * self.fit["scale"] * (2 * radius if squared else 1.0)
-                self.fit_band = ax.fill_between(x, centre - half, centre + half, color="tab:red",
-                                                alpha=0.25, linewidth=0, zorder=2)
+                sigma = RADIUS_UNCERTAINTY_UM * self.fit["scale"]
+                lower, upper = np.clip(radius - sigma, 0, None), radius + sigma
+                if squared:
+                    lower, upper = lower ** 2, upper ** 2
+                self.fit_band = ax.fill_between(x, lower, upper, color="tab:red", alpha=0.25, linewidth=0, zorder=2)
         else:
             self.fit_line.set_data([], [])
         if rescale:
@@ -1110,9 +1253,11 @@ class MfsStage(ttk.Frame):
         self.app = app
         self.t = self.r2 = None
         self.edb_t = self.edb_r2 = None
-        self.mfs = None
+        self.mfs = self.mfs_minus = self.mfs_plus = None
+        self.sigma = 0.0
         self.rows = []
         self.edge_lines = []
+        self.band = None
         self.v = {}
         self.source = tk.StringVar(value="No data yet: press Next on stage 1, or load a fit CSV and a cleaned "
                                          "EDB CSV.")
@@ -1151,10 +1296,14 @@ class MfsStage(ttk.Frame):
         self.field(panel, 2, 2, "Interval end (s)", "")
         self.field(panel, 3, 0, "Bin width (s, 0 = one interval)", "1000")
         self.field(panel, 3, 1, "Plot every Nth EDB point", "20")
+        self.field(panel, 3, 2, "Radius uncertainty (um)", f"{RADIUS_UNCERTAINTY_UM:g}").bind(
+            "<Return>", lambda _: self.update_model())
         r0 = ttk.Frame(panel)
-        r0.grid(row=3, column=4, columnspan=2, sticky="w")
+        r0.grid(row=4, column=0, columnspan=6, sticky="w")
         ttk.Button(r0, text="r₀ = first EDB point", command=self.r0_from_edb).pack(side="left", padx=2)
         ttk.Button(r0, text="r₀ = fit at start", command=self.r0_from_fit).pack(side="left", padx=2)
+        ttk.Label(r0, text="Uncertainty (corrected radius, 0 = off) shifts the whole fit and r₀ down / up together; "
+                           "the spread gives the error bars in stage 3.", foreground="#555").pack(side="left", padx=8)
 
         limits = ttk.LabelFrame(root, text="Plot axis limits (blank = automatic)", padding=6)
         limits.pack(fill="x", padx=4, pady=(4, 0))
@@ -1205,7 +1354,7 @@ class MfsStage(ttk.Frame):
         self.table = ttk.Treeview(frame, columns=CSV_COLUMNS, show="headings", height=6)
         for column in CSV_COLUMNS:
             self.table.heading(column, text=column)
-            self.table.column(column, width=220)
+            self.table.column(column, width=190)
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.table.yview)
         self.table.configure(yscrollcommand=scroll.set)
         self.table.pack(side="left", fill="x", expand=True)
@@ -1221,6 +1370,7 @@ class MfsStage(ttk.Frame):
         entry.grid(row=row, column=2 * col + 1, padx=3, pady=2)
         if key.startswith("Plot every"):
             self.stride_entry = entry
+        return entry
 
     def get(self, key):
         return self.v[key].get().strip()
@@ -1240,15 +1390,16 @@ class MfsStage(ttk.Frame):
 
     # data in
     def receive(self, data):
-        """Data handed over from stage 1."""
+        """Data handed over from stage 1, always on the corrected radius."""
         self.t, self.r2 = clean_fit_arrays(data["fit_t"], data["fit_r2"])
         self.edb_t, self.edb_r2 = data["edb_t"], data["edb_r"] ** 2
         self.after_fit_loaded()
         self.v["Initial radius (um)"].set(f"{data['edb_r'][0]:.8g}")
-        basis = ("refractive-index corrected radius (factor %.4f)" % data["factor"]) if data["basis"] == "corrected" \
-            else "raw radius (no refractive-index correction)"
-        self.source.set(f"From stage 1: {len(self.edb_t):,} cleaned points and a {len(self.t):,}-point fit, "
-                        f"{basis}. Initial radius set from the first cleaned point (editable).")
+        self.v["Radius uncertainty (um)"].set(f"{data['sigma']:.6g}")
+        refit = " (refitted on the corrected radius, same window)" if data["refitted"] else ""
+        self.source.set(f"From stage 1: {len(self.edb_t):,} cleaned points and a {len(self.t):,}-point fit{refit}, "
+                        f"refractive-index corrected radius (factor {data['factor']:.4f}), uncertainty "
+                        f"±{data['sigma']:.4g} um. Initial radius set from the first cleaned point (editable).")
         self.clear()
         self.update_model(rescale=True)
 
@@ -1263,12 +1414,12 @@ class MfsStage(ttk.Frame):
         if not path:
             return
         try:
-            self.t, self.r2 = read_fit_csv(path)
+            self.t, self.r2, sigma = read_fit_csv(path)
         except Exception as error:
             messagebox.showerror("Fit CSV error", str(error), parent=self)
             return
         self.after_fit_loaded()
-        self.source.set(f"Fit loaded from {Path(path).name}.")
+        self.source.set(f"Corrected-radius fit loaded from {Path(path).name}." + self.take_sigma(sigma))
         self.clear()
         self.update_model(rescale=True)
 
@@ -1278,17 +1429,24 @@ class MfsStage(ttk.Frame):
         if not path:
             return
         try:
-            t, r = read_edb_csv(path)
+            t, r, sigma = read_edb_csv(path)
         except Exception as error:
             messagebox.showerror("EDB CSV error", str(error), parent=self)
             return
         self.edb_t, self.edb_r2 = t, r * r
         self.v["Initial radius (um)"].set(f"{r[0]:.8g}")
-        self.status.set(f"EDB file: {len(t):,} points. First point t = {t[0]:.6g} s, radius = {r[0]:.6g} um "
-                        "(set as initial radius; editable). Column 2 is read, i.e. the raw radius in files "
-                        "saved by stage 1.")
+        self.status.set(f"EDB file: {len(t):,} points. First point t = {t[0]:.6g} s, corrected radius = "
+                        f"{r[0]:.6g} um (set as initial radius; editable). Read from radius_corrected_um saved by "
+                        "stage 1." + self.take_sigma(sigma))
         self.clear()
         self.update_model(rescale=True)
+
+    def take_sigma(self, sigma):
+        """Use the radius uncertainty stored in a loaded CSV; returns a note for the status line."""
+        if sigma is None:
+            return f" No uncertainty stored; keeping ±{self.get('Radius uncertainty (um)')} um."
+        self.v["Radius uncertainty (um)"].set(f"{sigma:.6g}")
+        return f" Radius uncertainty ±{sigma:.4g} um taken from the file."
 
     def r0_from_edb(self):
         if self.edb_r2 is None:
@@ -1305,17 +1463,36 @@ class MfsStage(ttk.Frame):
         self.update_model()
 
     def update_model(self, rescale=False):
-        self.mfs = None
+        self.mfs = self.mfs_minus = self.mfs_plus = None
         try:
-            self.mfs, info = make_mfs_function(
-                self.app.compounds, self.get("A: evaporating"), self.get("B: conserved"), self.get("Solvent"),
-                self.num("massA: evaporating", "Mass A"), self.num("massB: conserved", "Mass B"),
-                self.num("massSolvent", "Solvent mass"), self.num("Initial radius (um)", "Initial radius"))
+            args = (self.app.compounds, self.get("A: evaporating"), self.get("B: conserved"), self.get("Solvent"),
+                    self.num("massA: evaporating", "Mass A"), self.num("massB: conserved", "Mass B"),
+                    self.num("massSolvent", "Solvent mass"))
+            r0 = self.num("Initial radius (um)", "Initial radius")
+            sigma = self.num("Radius uncertainty (um)", "Radius uncertainty")
+            if not 0 <= sigma < r0:
+                raise ValueError("Radius uncertainty must be zero or positive and below the initial radius.")
+            mfs, info = make_mfs_function(*args, r0)
+            if sigma:
+                # a radius offset applies to every measured radius, including r0
+                self.mfs_minus = make_mfs_function(*args, r0 - sigma)[0]
+                self.mfs_plus = make_mfs_function(*args, r0 + sigma)[0]
+            self.mfs, self.sigma = mfs, sigma
             self.info.set(f"Initial dry x(A) = {info['x_a0']:.6g}; calculated dry (A+B) radius = "
-                          f"{info['r_dry']:.6g} um. Below this radius solvent is gone and A is lost.")
+                          f"{info['r_dry']:.6g} um. Below this radius solvent is gone and A is lost. "
+                          + (f"Radius uncertainty ±{sigma:.4g} um propagated." if sigma else
+                             "No radius uncertainty propagated."))
         except ValueError as error:
             self.info.set(f"Composition: {error}")
         self.draw(rescale=rescale)
+
+    def scenarios(self):
+        """(r2, mfs) for the nominal fit, then with the radius shifted down and up by the uncertainty."""
+        if not self.sigma:
+            return [(self.r2, self.mfs)] * 3
+        r = np.sqrt(self.r2)
+        lower = np.where(r > self.sigma, (r - self.sigma) ** 2, np.nan)
+        return [(self.r2, self.mfs), (lower, self.mfs_minus), ((r + self.sigma) ** 2, self.mfs_plus)]
 
     def set_mode(self):
         text = str(self.toolbar.mode).lower()
@@ -1357,8 +1534,16 @@ class MfsStage(ttk.Frame):
             self.line_edb.set_data(self.edb_t[::stride], self.edb_r2[::stride])
         else:
             self.line_edb.set_data([], [])
+        if self.band is not None:
+            self.band.remove()
+            self.band = None
         if self.t is not None:
             self.line_r2.set_data(self.t, self.r2)
+            if self.sigma:
+                r = np.sqrt(self.r2)
+                self.band = ax.fill_between(self.t, np.clip(r - self.sigma, 0, None) ** 2, (r + self.sigma) ** 2,
+                                            color="tab:red", alpha=0.2, linewidth=0, zorder=1,
+                                            label=f"Fit ± {self.sigma:.3g} µm radius")
         else:
             self.line_r2.set_data([], [])
         for line in self.edge_lines:
@@ -1399,18 +1584,22 @@ class MfsStage(ttk.Frame):
             hi = self.num("Interval end (s)", "Interval end")
             width = self.num("Bin width (s, 0 = one interval)", "Bin width")
             lo, hi = max(lo, self.t[0]), min(hi, self.t[-1])
-            rows, skipped = interval_results(self.t, self.r2, self.mfs, lo, hi, width)
+            rows, skipped = interval_results(self.t, self.scenarios(), lo, hi, width)
         except ValueError as error:
             messagebox.showerror("Calculation error", str(error), parent=self)
             return False
         self.clear()
         self.rows = rows
-        for average, gradient in rows:
-            self.table.insert("", "end", values=(f"{average:.6g}", f"{gradient:.6g}"))
-        message = f"{len(rows)} interval(s) calculated."
+        for row in rows:
+            self.table.insert("", "end", values=tuple("" if math.isnan(v) else f"{v:.6g}" for v in row))
+        message = f"{len(rows)} interval(s) calculated"
+        message += f" with ±{self.sigma:.4g} um radius uncertainty." if self.sigma else " (no radius uncertainty)."
         if skipped:
             message += (f" {skipped} skipped (fewer than {MIN_POINTS} fit points, or A would be negative "
                         "i.e. radius below the B-only radius).")
+        partial = sum(any(math.isnan(v) for v in row) for row in rows)
+        if partial:
+            message += f" {partial} interval(s) have no value for a shifted radius (A would be negative there)."
         self.status.set(message)
         return True
 
@@ -1447,8 +1636,8 @@ class MfsStage(ttk.Frame):
                 return None
             if not self.calculate() or not self.rows:
                 return None
-        x, g = zip(*self.rows)
-        return sort_mfs_gradient(x, g)
+        rows = np.asarray(self.rows, dtype=float)
+        return sort_mfs_gradient(rows[:, 0], rows[:, 1], rows[:, 2:])
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1456,7 +1645,7 @@ class MfsStage(ttk.Frame):
 # ----------------------------------------------------------------------------------------------------------------
 
 class PlotStudio(tk.Toplevel):
-    def __init__(self, master, series, xlabel, ylabel, filename="figure.png"):
+    def __init__(self, master, series, xlabel, ylabel, filename="figure.png", show_xerr=True, show_yerr=True):
         super().__init__(master)
         self.title("Publication plot")
         self.geometry("1280x900")
@@ -1514,7 +1703,11 @@ class PlotStudio(tk.Toplevel):
         entry("height", "Height (in)", "5")
         self.legend = tk.BooleanVar(value=True)
         self.grid_on = tk.BooleanVar(value=False)
-        for text, var in (("Show legend", self.legend), ("Show grid", self.grid_on)):
+        self.xerr = tk.BooleanVar(value=show_xerr)
+        self.yerr = tk.BooleanVar(value=show_yerr)
+        for text, var in (("Show legend", self.legend), ("Show grid", self.grid_on),
+                          ("Show x error bars (radius uncertainty)", self.xerr),
+                          ("Show y error bars (radius uncertainty)", self.yerr)):
             ttk.Checkbutton(form, text=text, variable=var, command=self.schedule).grid(
                 row=row[0], column=0, columnspan=2, sticky="w")
             row[0] += 1
@@ -1533,10 +1726,11 @@ class PlotStudio(tk.Toplevel):
         self.update_plot()
 
     def set_data(self, data):
-        """data: {series name: (x, y) or None}. Style edits are kept."""
+        """data: {series name: (x, y), (x, y, bounds) or None}. Style edits are kept."""
         for s in self.series:
-            xy = data.get(s["name"])
-            s["x"], s["y"] = (xy if xy is not None else (None, None))
+            xy = data.get(s["name"]) or (None, None)
+            s["x"], s["y"] = xy[:2]
+            s["bounds"] = xy[2] if len(xy) > 2 else None
         self.schedule()
 
     def schedule(self):
@@ -1570,7 +1764,8 @@ class PlotStudio(tk.Toplevel):
             yscale=get("yscale") if get("yscale") in ("linear", "log") else "linear",
             xmin=self.number("xmin", "X min", True), xmax=self.number("xmax", "X max", True),
             ymin=self.number("ymin", "Y min", True), ymax=self.number("ymax", "Y max", True),
-            legend=self.legend.get(), grid=self.grid_on.get(), series=styles,
+            legend=self.legend.get(), grid=self.grid_on.get(), xerr=self.xerr.get(), yerr=self.yerr.get(),
+            series=styles,
             width=self.number("width", "Width", positive=True), height=self.number("height", "Height", positive=True))
 
     def render(self, o):
@@ -1629,7 +1824,7 @@ class ActivityStage(ttk.Frame):
         super().__init__(master)
         self.app = app
         self.theory = self.experiment = self.tables = None
-        self.points = self.curve = None
+        self.points = self.curve = self.bounds = None
         self.studio = None
         self.source = tk.StringVar(value="Experimental data: none yet (press Next on stage 2, or load a CSV).")
 
@@ -1660,6 +1855,10 @@ class ActivityStage(ttk.Frame):
                                           state="readonly")
         self.component_box.pack(side="left")
         self.component_box.bind("<<ComboboxSelected>>", lambda _: self.refresh())
+        self.xerr = tk.BooleanVar(value=True)
+        self.yerr = tk.BooleanVar(value=True)
+        for text, var in (("x error bars", self.xerr), ("y error bars", self.yerr)):
+            ttk.Checkbutton(opts, text=text, variable=var, command=self.refresh).pack(side="left", padx=(14, 0))
 
         lim = ttk.Frame(root)
         lim.pack(fill="x", padx=4, pady=3)
@@ -1690,8 +1889,8 @@ class ActivityStage(ttk.Frame):
 
     def receive(self, experiment):
         self.experiment = experiment
-        self.source.set(f"Experimental data: {len(experiment[0])} interval(s) from stage 2. "
-                        "Load your theoretical (DropletLab) CSV and AIOMFAC file.")
+        self.source.set(f"Experimental data: {len(experiment[0])} interval(s) from stage 2"
+                        f"{self.uncertainty_note()}. Load your theoretical (DropletLab) CSV and AIOMFAC file.")
         self.refresh()
 
     def pick(self, title, types):
@@ -1700,7 +1899,7 @@ class ActivityStage(ttk.Frame):
     def load_theory(self):
         path = self.pick("Theoretical (DropletLab) CSV", [("CSV", "*.csv"), ("All files", "*")])
         if path:
-            self.safe(lambda: setattr(self, "theory", read_mfs_gradient(path)))
+            self.safe(lambda: setattr(self, "theory", read_mfs_gradient(path)[:2]))
 
     def load_experiment(self):
         path = self.pick("Experimental CSV", [("CSV", "*.csv"), ("All files", "*")])
@@ -1708,8 +1907,13 @@ class ActivityStage(ttk.Frame):
             def work():
                 self.experiment = read_mfs_gradient(path)
                 self.source.set(f"Experimental data: {len(self.experiment[0])} row(s) from {Path(path).name} "
-                                "(overrides stage 2).")
+                                f"(overrides stage 2){self.uncertainty_note()}.")
             self.safe(work)
+
+    def uncertainty_note(self):
+        if self.experiment[2] is None:
+            return ", no radius-uncertainty columns (no error bars)"
+        return ", with radius-uncertainty columns (error bars)"
 
     def load_aiomfac(self):
         path = self.pick("AIOMFAC output file", [("Text", "*.txt"), ("All files", "*")])
@@ -1730,7 +1934,8 @@ class ActivityStage(ttk.Frame):
         self.refresh()
 
     def studio_data(self):
-        return {"AIOMFAC": self.curve, "Experiment": self.points}
+        points = None if self.points is None else (*self.points, self.bounds)
+        return {"AIOMFAC": self.curve, "Experiment": points}
 
     def open_studio(self):
         if self.studio is not None and self.studio.winfo_exists():
@@ -1740,7 +1945,8 @@ class ActivityStage(ttk.Frame):
         series = [dict(name="AIOMFAC", kind="line", label="AIOMFAC", color="black", style="solid", width=1.2),
                   dict(name="Experiment", kind="points", label="Experiment", color="black", marker="square", size=5)]
         self.studio = PlotStudio(self.winfo_toplevel(), series, rf"$x_{{\mathrm{{{label}}}}}$",
-                                 rf"$\gamma_{{\mathrm{{{label}}}}}$", "activity_coefficient.png")
+                                 rf"$\gamma_{{\mathrm{{{label}}}}}$", "activity_coefficient.png",
+                                 self.xerr.get(), self.yerr.get())
         self.studio.set_data(self.studio_data())
 
     def auto_limits(self):
@@ -1750,13 +1956,18 @@ class ActivityStage(ttk.Frame):
 
     def refresh(self):
         notes = []
-        self.points = self.curve = None
+        self.points = self.curve = self.bounds = None
         if self.experiment is not None and self.theory is None:
             notes.append(f"{len(self.experiment[0])} experimental interval(s) ready; load the theoretical CSV.")
         if self.theory is not None and self.experiment is not None:
-            x, gamma, outside, zero = activity_coefficients(*self.experiment, *self.theory)
+            x_exp, g_exp, extra = self.experiment
+            x, gamma, outside, zero, self.bounds, truncated = activity_coefficients(x_exp, g_exp, *self.theory,
+                                                                                    extra)
             self.points = (x, gamma)
-            notes.append(f"{len(x)} experimental activity coefficients calculated.")
+            notes.append(f"{len(x)} experimental activity coefficients calculated"
+                         + (" with radius-uncertainty error bars." if self.bounds is not None else "."))
+            if truncated:
+                notes.append(f"{truncated} error bar(s) truncated (shifted MFS outside the theoretical range).")
             if outside:
                 notes.append(f"{outside} point(s) outside the theoretical MFS range skipped.")
             if zero:
@@ -1779,7 +1990,8 @@ class ActivityStage(ttk.Frame):
             limits = None
             notes.append(f"Limits ignored: {error}")
         self.info.set(" ".join(notes))
-        draw_activity(self.ax, self.name.get().strip() or "A", self.points, self.curve, limits)
+        draw_activity(self.ax, self.name.get().strip() or "A", self.points, self.curve, limits, self.bounds,
+                      self.xerr.get(), self.yerr.get())
         self.fig.tight_layout()
         self.canvas.draw_idle()
         if self.studio is not None and self.studio.winfo_exists():
@@ -1795,8 +2007,11 @@ class ActivityStage(ttk.Frame):
         if not path:
             return
         try:
-            pd.DataFrame({"MFS": self.points[0], "Activity coefficient": self.points[1]}).to_csv(
-                path, index=False, float_format="%.10g")
+            columns = {"MFS": self.points[0], "Activity coefficient": self.points[1]}
+            if self.bounds is not None:
+                columns.update(zip(("MFS min", "MFS max", "Activity coefficient min", "Activity coefficient max"),
+                                   self.bounds))
+            pd.DataFrame(columns).to_csv(path, index=False, float_format="%.10g")
         except OSError as error:
             messagebox.showerror("Export failed", str(error), parent=self)
             return
