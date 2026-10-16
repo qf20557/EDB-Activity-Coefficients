@@ -39,6 +39,14 @@ AIOMFAC_COLUMN = "a_x"
 AIOMFAC_DIR = Path(__file__).resolve().with_name("AIOMFAC simulations")
 SAVE_DPI = 1200
 matplotlib.rcParams["savefig.dpi"] = SAVE_DPI  # every save (including toolbar save buttons) is 1200 dpi
+# theoretical (DropletLab) CSV columns, matched by name (see column_key); older 2-column files are read by position
+THEORY_X, THEORY_G = "Average MFS", "Gradient (µm²/s)"
+THEORY_SIGMA = "Gradient uncertainty (± µm²/s)"
+THEORY_P = ("Acid p_vap at T_ref (Pa)", "Acid p_vap lower (Pa)", "Acid p_vap upper (Pa)")
+THEORY_CHECK = ("Gradient lower p_vap at nominal MFS (µm²/s)", "Gradient upper p_vap at nominal MFS (µm²/s)")
+PVAP_COLUMNS = ("Activity coefficient p_vap lower", "Activity coefficient p_vap upper",
+                "Activity coefficient min (radius, at p_vap upper)", "Activity coefficient max (radius, at p_vap lower)",
+                "Activity coefficient combined lower", "Activity coefficient combined upper") + THEORY_P
 COLOURS = ("black", "red", "blue", "green", "orange", "purple", "grey", "brown", "teal", "magenta")
 MARKERS = {"square": "s", "circle": "o", "triangle": "^", "diamond": "D", "cross (x)": "x", "plus": "+"}
 LINE_STYLES = {"solid": "-", "dashed": "--", "dash-dot": "-.", "dotted": ":"}
@@ -588,17 +596,198 @@ def activity_coefficients(x_exp, g_exp, x_theory, g_theory, extra=None):
     return x, gamma, int((~inside).sum()), int((inside & ~nonzero).sum()), bounds, truncated
 
 
-def error_bars(ax, x, y, bounds, keep, color, show_x=True, show_y=True, zorder=3):
+def column_key(name):
+    """Header normalised for matching by name: lower case, µ/μ -> u, ² -> 2, letters and digits only."""
+    text = str(name).strip().lower().replace("µ", "u").replace("μ", "u").replace("²", "2")
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
+def read_theory_csv(path):
+    """(MFS, gradient, pvap) from a theoretical (DropletLab) CSV, columns matched by name. A file without the named
+    MFS / gradient columns (older 2-column files) is read exactly as before, with pvap None. Otherwise pvap is None
+    (no uncertainty columns) or a dict: p, p_lower, p_upper (Pa, or None), sigma (gradient uncertainty aligned with
+    the returned MFS, or None) and check (worst deviation of bound-run gradient / nominal gradient from p_bound / p,
+    or None). The bound-run columns are only used for that check: the lower run does not reach low MFS."""
+    df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    cols = {column_key(c): c for c in df.columns}
+    if column_key(THEORY_X) not in cols or column_key(THEORY_G) not in cols:
+        return (*read_mfs_gradient(path)[:2], None)
+
+    def column(name):
+        key = column_key(name)
+        return pd.to_numeric(df[cols[key]], errors="coerce").to_numpy(float) if key in cols else None
+
+    def constant(values):
+        values = values[np.isfinite(values) & (values > 0)] if values is not None else []
+        return float(np.median(values)) if len(values) else None
+
+    x, g = column(THEORY_X), column(THEORY_G)
+    good = np.isfinite(x) & np.isfinite(g)
+    x_sorted, g_sorted, _ = sort_mfs_gradient(x, g)
+    order = np.argsort(x[good], kind="stable")  # the order sort_mfs_gradient used
+    sigma = column(THEORY_SIGMA)
+    if sigma is not None:
+        sigma = sigma[good][order]
+        if not np.any(np.isfinite(sigma)):
+            sigma = None
+    p = [constant(column(name)) for name in THEORY_P]
+    if None in p:
+        p = [None] * 3
+    check = None
+    if p[0] is not None:
+        deviations = []
+        for name, p_bound in zip(THEORY_CHECK, p[1:]):
+            g_bound = column(name)
+            if g_bound is not None:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    d = np.abs(g_bound / g / (p_bound / p[0]) - 1)
+                d = d[np.isfinite(d)]
+                if d.size:
+                    deviations.append(float(d.max()))
+        check = max(deviations) if deviations else None
+    if p[0] is None and sigma is None:
+        return x_sorted, g_sorted, None
+    return x_sorted, g_sorted, dict(p=p[0], p_lower=p[1], p_upper=p[2], sigma=sigma, check=check)
+
+
+def pvap_factors(x, x_theory, g_theory, pvap):
+    """Per-point multiplicative factors (lower, upper, source) on gamma = g_exp / g_ideal for the acid vapour-pressure
+    uncertainty. g_ideal is proportional to p_vap and sits in the denominator, so the factors are p / p_upper and
+    p / p_lower (source 'a', from the p_vap columns), else 1 / (1 + rel) and 1 / (1 - rel) with rel = sigma / |g_ideal|
+    interpolated in MFS (source 'b'; upper is inf where rel >= 1). None if the file has neither."""
+    if pvap is None:
+        return None
+    x = np.asarray(x, dtype=float)
+    if pvap["p"] is not None:
+        p, p_lo, p_hi = pvap["p"], min(pvap["p_lower"], pvap["p_upper"]), max(pvap["p_lower"], pvap["p_upper"])
+        return np.full(len(x), p / p_hi), np.full(len(x), p / p_lo), "a"
+    if pvap["sigma"] is None:
+        return None
+    ux, idx = np.unique(x_theory, return_index=True)
+    gt, st = g_theory[idx], np.abs(pvap["sigma"][idx])
+    ok = np.isfinite(st)
+    rel = np.full(len(x), np.nan)
+    inside = (x >= ux[ok][0]) & (x <= ux[ok][-1])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel[inside] = np.interp(x[inside], ux[ok], st[ok]) / np.abs(np.interp(x[inside], ux, gt))
+        upper = np.where(rel >= 1, np.inf, 1 / (1 - rel))
+        return 1 / (1 + rel), upper, "b"
+
+
+def pvap_bounds(gamma, bounds, factors, pvap):
+    """p_vap uncertainty on gamma from pvap_factors. lower / upper: gamma times the factors. radius_lower / _upper: the
+    radius-uncertainty bounds at the p_vap extremes (None without radius bounds). combined_lower / _upper: per point,
+    log-space quadrature of the radius and p_vap relative uncertainties (NaN where gamma <= 0)."""
+    f_lo, f_hi, source = factors
+    gamma = np.asarray(gamma, dtype=float)
+    out = dict(source=source, f_lower=f_lo, f_upper=f_hi, lower=gamma * f_lo, upper=gamma * f_hi,
+               radius_lower=None, radius_upper=None,
+               p=(pvap["p"], pvap["p_lower"], pvap["p_upper"]), check=pvap["check"])
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        d_lo, d_hi = -np.log(f_lo), np.log(f_hi)
+        r_lo = r_hi = np.zeros(len(gamma))
+        if bounds is not None:
+            out["radius_lower"], out["radius_upper"] = bounds[2] * f_lo, bounds[3] * f_hi
+            r_lo = np.where(bounds[2] > 0, np.log(gamma / bounds[2]), np.inf)
+            r_hi = np.log(bounds[3] / gamma)
+        positive = gamma > 0
+        out["combined_lower"] = np.where(positive, gamma * np.exp(-np.hypot(r_lo, d_lo)), np.nan)
+        out["combined_upper"] = np.where(positive, gamma * np.exp(np.hypot(r_hi, d_hi)), np.nan)
+    return out
+
+
+def _range(values, digits=3):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if not values.size:
+        return "n/a"
+    lo, hi = values.min(), values.max()
+    return f"{lo:.{digits}f}" if round(lo, digits) == round(hi, digits) else f"{lo:.{digits}f}-{hi:.{digits}f}"
+
+
+def pvap_note(unc):
+    """Status text for pvap_bounds output, e.g. 'p_vap 1.1e-3 Pa (0.8-1.4e-3): gamma x0.786-x1.375, systematic'."""
+    if unc["source"] == "a":
+        p, p_lo, p_hi = unc["p"]
+        e = math.floor(math.log10(p))
+        m = lambda v: f"{v / 10 ** e:.3g}"
+        text = (f"p_vap {m(p)}e{e} Pa ({m(min(p_lo, p_hi))}-{m(max(p_lo, p_hi))}e{e}): gamma x{p / max(p_lo, p_hi):.3f}"
+                f"-x{p / min(p_lo, p_hi):.3f}, systematic (source a: p_vap columns).")
+        if unc["check"] is not None:
+            text += (f" Bound-run check: bound / nominal gradient within {100 * unc['check']:.2g}% of "
+                     f"p_bound / p.")
+        return text
+    upper = unc["f_upper"]
+    text = (f"p_vap from gradient uncertainty: gamma x{_range(unc['f_lower'])}-x{_range(upper)}, systematic "
+            f"(source b: no p_vap columns).")
+    if np.any(np.isinf(upper)):
+        text += f" Upper bound open (infinite) for {int(np.sum(np.isinf(upper)))} point(s): relative uncertainty >= 1."
+    missing = int(np.sum(~np.isfinite(unc["f_lower"])))
+    if missing:
+        text += f" {missing} point(s) outside the gradient-uncertainty range have no p_vap bounds."
+    return text
+
+
+def activity_frame(x, gamma, bounds=None, unc=None):
+    """Export table: MFS and gamma, the radius bounds when present, and the p_vap columns when present."""
+    columns = {"MFS": x, "Activity coefficient": gamma}
+    if bounds is not None:
+        columns.update(zip(("MFS min", "MFS max", "Activity coefficient min", "Activity coefficient max"), bounds))
+    if unc is not None:
+        n, nan = len(x), np.full(len(x), np.nan)
+        values = [unc["lower"], unc["upper"],
+                  nan if unc["radius_lower"] is None else unc["radius_lower"],
+                  nan if unc["radius_upper"] is None else unc["radius_upper"],
+                  unc["combined_lower"], unc["combined_upper"]]
+        values += [np.full(n, np.nan if p is None else p) for p in unc["p"]]
+        columns.update(zip(PVAP_COLUMNS, values))
+    return pd.DataFrame(columns)
+
+
+def error_bars(ax, x, y, bounds, keep, color, show_x=True, show_y=True, zorder=3, alpha=1.0):
     """Asymmetric error bars from bounds = (x_lo, x_hi, y_lo, y_hi) for the points selected by keep."""
     if not (show_x or show_y):
         return
     x_lo, x_hi, y_lo, y_hi = (np.asarray(b, dtype=float)[keep] for b in bounds)
     x, y = np.asarray(x, dtype=float)[keep], np.asarray(y, dtype=float)[keep]
     ax.errorbar(x, y, xerr=[x - x_lo, x_hi - x] if show_x else None, yerr=[y - y_lo, y_hi - y] if show_y else None,
-                fmt="none", ecolor=color, elinewidth=0.8, capsize=2, zorder=zorder)
+                fmt="none", ecolor=color, elinewidth=0.8, capsize=2, zorder=zorder, alpha=alpha)
 
 
-def draw_activity(ax, label, points=None, curve=None, limits=None, bounds=None, show_x=True, show_y=True):
+def _open_to_top(ax, values):
+    """An open (infinite) upper bound is drawn to the top of the axes; call after the limits are set."""
+    values = np.asarray(values, dtype=float)
+    return np.where(np.isposinf(values), ax.get_ylim()[1], values)
+
+
+def pvap_band(ax, x, unc, keep, color="grey", alpha=0.25, label="p_vap range"):
+    """Systematic p_vap range as a light band behind the points (sorted by MFS)."""
+    x = np.asarray(x, dtype=float)
+    keep = np.asarray(keep, dtype=bool) & np.isfinite(unc["lower"]) & ~np.isnan(unc["upper"])
+    if not keep.any():
+        return
+    order = np.argsort(x[keep], kind="stable")
+    lo, hi = unc["lower"][keep][order], _open_to_top(ax, unc["upper"][keep][order])
+    ax.fill_between(x[keep][order], lo, hi, color=color, alpha=alpha, linewidth=0, zorder=1, label=label)
+
+
+def combined_bars(ax, x, y, unc, keep, color, alpha=1.0):
+    keep = np.asarray(keep, dtype=bool) & np.isfinite(unc["combined_lower"]) & ~np.isnan(unc["combined_upper"])
+    if keep.any():
+        bounds = (x, x, unc["combined_lower"], _open_to_top(ax, unc["combined_upper"]))
+        error_bars(ax, x, y, bounds, keep, color, show_x=False, zorder=2.5, alpha=alpha)
+
+
+def pvap_values(unc, band, combined):
+    """y values a shown band / combined bars add to the automatic limits (finite only)."""
+    if unc is None:
+        return []
+    keys = (("lower", "upper") if band else ()) + (("combined_lower", "combined_upper") if combined else ())
+    return [np.asarray(unc[k], dtype=float) for k in keys]
+
+
+def draw_activity(ax, label, points=None, curve=None, limits=None, bounds=None, show_x=True, show_y=True,
+                  unc=None, show_band=True, show_combined=False):
     ax.clear()
     if bounds is not None:
         # hidden bars do not widen the automatic limits either
@@ -638,6 +827,7 @@ def draw_activity(ax, label, points=None, curve=None, limits=None, bounds=None, 
             values.append(points[1][points[1] > 0])
             if bounds is not None:
                 values += [bounds[2], bounds[3]]
+            values += pvap_values(unc, show_band, show_combined)
     values = [v[np.isfinite(v) & (v > 0)] for v in values]
     values = np.concatenate(values) if values else np.array([])
     if values.size:
@@ -645,6 +835,12 @@ def draw_activity(ax, label, points=None, curve=None, limits=None, bounds=None, 
     xmin, xmax, ymin, ymax = limits or (None, None, None, None)
     apply_limits(ax, xmin, xmax, "x")
     apply_limits(ax, ymin, ymax, "y")
+    if has_points and unc is not None:
+        keep = points[1] > 0
+        if show_band:
+            pvap_band(ax, points[0], unc, keep)
+        if show_combined:
+            combined_bars(ax, *points, unc, keep, "tab:red", 0.7)
     if curve is not None or has_points:
         ax.legend(frameon=False, loc="upper left")
 
@@ -660,9 +856,9 @@ def _has_data(series):
     return series.get("x") is not None and len(series["x"]) > 0
 
 
-def auto_axis_limits(series, xscale, yscale, xerr=True, yerr=True):
+def auto_axis_limits(series, xscale, yscale, xerr=True, yerr=True, band=False, combined=False):
     """Default (xlim, ylim) from the data. Point series set the x range; lines only if there are no points.
-    Shown error bars (xerr / yerr) are included in the range."""
+    Shown error bars (xerr / yerr), p_vap band and combined bars are included in the range."""
     series = [s for s in series if _has_data(s)]
     points = [s for s in series if s["kind"] == "points"]
     lines = [s for s in series if s["kind"] == "line"]
@@ -692,6 +888,7 @@ def auto_axis_limits(series, xscale, yscale, xerr=True, yerr=True):
         values.append(np.asarray(s["y"], dtype=float))
         if yerr and s.get("bounds") is not None:
             values += [np.asarray(b, dtype=float) for b in s["bounds"][2:]]
+        values += pvap_values(s.get("pvap"), band, combined)
     values = np.concatenate(values) if values else np.array([])
     values = values[np.isfinite(values)]
     if yscale == "log":
@@ -706,8 +903,12 @@ def auto_axis_limits(series, xscale, yscale, xerr=True, yerr=True):
 
 def draw_publication(ax, series, o):
     for name, style in o["series"].items():
-        if not is_color_like(style["color"]):
-            raise ValueError(f"'{style['color']}' is not a valid colour (use a name such as red, or a hex code like #1f77b4).")
+        for key in ("color", "bar_color", "band_color", "comb_color"):
+            if not is_color_like(style[key]):
+                raise ValueError(f"'{style[key]}' is not a valid colour (use a name such as red, or a hex code like #1f77b4).")
+        for key in ("bar_alpha", "band_alpha", "comb_alpha"):
+            if not 0 <= style[key] <= 1:
+                raise ValueError(f"{name} alpha values must be between 0 and 1.")
     for name, lo, hi, scale in (("X", o["xmin"], o["xmax"], o["xscale"]), ("Y", o["ymin"], o["ymax"], o["yscale"])):
         if lo is not None and hi is not None and lo >= hi:
             raise ValueError(f"{name} min must be below {name} max.")
@@ -730,14 +931,25 @@ def draw_publication(ax, series, o):
                         label=st["label"], zorder=3)
                 if s.get("bounds") is not None:
                     keep = np.asarray(s["y"], dtype=float) > 0 if o["yscale"] == "log" else slice(None)
-                    error_bars(ax, s["x"], s["y"], s["bounds"], keep, st["color"], o["xerr"], o["yerr"])
-    xlim, ylim = auto_axis_limits(series, o["xscale"], o["yscale"], o["xerr"], o["yerr"])
+                    error_bars(ax, s["x"], s["y"], s["bounds"], keep, st["bar_color"], o["xerr"], o["yerr"],
+                               alpha=st["bar_alpha"])
+    xlim, ylim = auto_axis_limits(series, o["xscale"], o["yscale"], o["xerr"], o["yerr"], o["band"], o["combined"])
     if xlim:
         ax.set_xlim(*xlim)
     if ylim:
         ax.set_ylim(*ylim)
     apply_limits(ax, o["xmin"], o["xmax"], "x")
     apply_limits(ax, o["ymin"], o["ymax"], "y")
+    for s in series:  # drawn once the limits are set, so an open upper bound reaches the top of the axes
+        if s["kind"] != "points" or not _has_data(s) or s.get("pvap") is None:
+            continue
+        st = o["series"][s["name"]]
+        y = np.asarray(s["y"], dtype=float)
+        keep = y > 0 if o["yscale"] == "log" else np.ones(len(y), dtype=bool)
+        if o["band"]:
+            pvap_band(ax, s["x"], s["pvap"], keep, st["band_color"], st["band_alpha"], st["band_label"])
+        if o["combined"]:
+            combined_bars(ax, s["x"], y, s["pvap"], keep, st["comb_color"], st["comb_alpha"])
     ax.set_xlabel(o["xlabel"], fontsize=size)
     ax.set_ylabel(o["ylabel"], fontsize=size)
     if o["title"]:
@@ -1677,7 +1889,8 @@ class MfsStage(ttk.Frame):
 # ----------------------------------------------------------------------------------------------------------------
 
 class PlotStudio(tk.Toplevel):
-    def __init__(self, master, series, xlabel, ylabel, filename="figure.png", show_xerr=True, show_yerr=True):
+    def __init__(self, master, series, xlabel, ylabel, filename="figure.png", show_xerr=True, show_yerr=True,
+                 show_band=True, show_combined=False):
         super().__init__(master)
         self.title("Publication plot")
         self.geometry("1280x900")
@@ -1730,6 +1943,13 @@ class PlotStudio(tk.Toplevel):
             else:
                 entry(s["name"] + ".marker", "Marker", s.get("marker", "square"), tuple(MARKERS))
                 entry(s["name"] + ".size", "Marker size", s.get("size", 5))
+                entry(s["name"] + ".bar_color", "Radius bar colour (blank = marker)", "", COLOURS)
+                entry(s["name"] + ".bar_alpha", "Radius bar alpha (0-1)", 1.0)
+                entry(s["name"] + ".band_label", "p_vap band legend label", "p_vap range")
+                entry(s["name"] + ".band_color", "p_vap band colour", "grey", COLOURS)
+                entry(s["name"] + ".band_alpha", "p_vap band alpha (0-1)", 0.25)
+                entry(s["name"] + ".comb_color", "Combined bar colour", "red", COLOURS)
+                entry(s["name"] + ".comb_alpha", "Combined bar alpha (0-1)", 0.7)
         header("Figure")
         entry("width", "Width (in)", "6.5")
         entry("height", "Height (in)", "5")
@@ -1737,9 +1957,13 @@ class PlotStudio(tk.Toplevel):
         self.grid_on = tk.BooleanVar(value=False)
         self.xerr = tk.BooleanVar(value=show_xerr)
         self.yerr = tk.BooleanVar(value=show_yerr)
+        self.band = tk.BooleanVar(value=show_band)
+        self.combined = tk.BooleanVar(value=show_combined)
         for text, var in (("Show legend", self.legend), ("Show grid", self.grid_on),
                           ("Show x error bars (radius uncertainty)", self.xerr),
-                          ("Show y error bars (radius uncertainty)", self.yerr)):
+                          ("Show y error bars (radius uncertainty)", self.yerr),
+                          ("Show p_vap band (systematic)", self.band),
+                          ("Show combined y error bars (radius + p_vap)", self.combined)):
             ttk.Checkbutton(form, text=text, variable=var, command=self.schedule).grid(
                 row=row[0], column=0, columnspan=2, sticky="w")
             row[0] += 1
@@ -1758,11 +1982,13 @@ class PlotStudio(tk.Toplevel):
         self.update_plot()
 
     def set_data(self, data):
-        """data: {series name: (x, y), (x, y, bounds) or None}. Style edits are kept."""
+        """data: {series name: (x, y), (x, y, bounds), (x, y, bounds, pvap) or None}; pvap is pvap_bounds output.
+        Style edits are kept."""
         for s in self.series:
             xy = data.get(s["name"]) or (None, None)
             s["x"], s["y"] = xy[:2]
             s["bounds"] = xy[2] if len(xy) > 2 else None
+            s["pvap"] = xy[3] if len(xy) > 3 else None
         self.schedule()
 
     def schedule(self):
@@ -1783,8 +2009,15 @@ class PlotStudio(tk.Toplevel):
             n = s["name"]
             marker = get(n + ".marker").strip() if n + ".marker" in self.v else "square"
             style = get(n + ".style").strip() if n + ".style" in self.v else "solid"
+            color = get(n + ".color").strip()
+            text = lambda key, default: get(n + key).strip() if n + key in self.v else default
+            alpha = lambda key, default: self.number(n + key, f"{n} alpha") if n + key in self.v else default
             styles[n] = dict(
-                label=get(n + ".label"), color=get(n + ".color").strip(),
+                bar_color=text(".bar_color", "") or color, bar_alpha=alpha(".bar_alpha", 1.0),
+                band_label=text(".band_label", "p_vap range"), band_color=text(".band_color", "grey"),
+                band_alpha=alpha(".band_alpha", 0.25), comb_color=text(".comb_color", "red"),
+                comb_alpha=alpha(".comb_alpha", 0.7),
+                label=get(n + ".label"), color=color,
                 marker=MARKERS.get(marker, marker if marker in MARKERS.values() else "s"),
                 size=self.number(n + ".size", n + " marker size", positive=True) if n + ".size" in self.v else 5.0,
                 style=LINE_STYLES.get(style, style if style in LINE_STYLES.values() else "-"),
@@ -1797,6 +2030,7 @@ class PlotStudio(tk.Toplevel):
             xmin=self.number("xmin", "X min", True), xmax=self.number("xmax", "X max", True),
             ymin=self.number("ymin", "Y min", True), ymax=self.number("ymax", "Y max", True),
             legend=self.legend.get(), grid=self.grid_on.get(), xerr=self.xerr.get(), yerr=self.yerr.get(),
+            band=self.band.get(), combined=self.combined.get(),
             series=styles,
             width=self.number("width", "Width", positive=True), height=self.number("height", "Height", positive=True))
 
@@ -1855,8 +2089,8 @@ class ActivityStage(ttk.Frame):
     def __init__(self, master, app):
         super().__init__(master)
         self.app = app
-        self.theory = self.experiment = self.tables = None
-        self.points = self.curve = self.bounds = None
+        self.theory = self.theory_pvap = self.experiment = self.tables = None
+        self.points = self.curve = self.bounds = self.unc = None
         self.studio = None
         self.source = tk.StringVar(value="Experimental data: none yet (press Next on stage 2, or load a CSV).")
 
@@ -1897,7 +2131,10 @@ class ActivityStage(ttk.Frame):
         self.component_box.bind("<<ComboboxSelected>>", lambda _: self.refresh())
         self.xerr = tk.BooleanVar(value=True)
         self.yerr = tk.BooleanVar(value=True)
-        for text, var in (("x error bars", self.xerr), ("y error bars", self.yerr)):
+        self.band = tk.BooleanVar(value=True)
+        self.combined = tk.BooleanVar(value=False)
+        for text, var in (("x error bars (radius)", self.xerr), ("y error bars (radius)", self.yerr),
+                          ("p_vap band", self.band), ("combined y bars", self.combined)):
             ttk.Checkbutton(opts, text=text, variable=var, command=self.refresh).pack(side="left", padx=(14, 0))
 
         lim = ttk.Frame(root)
@@ -1939,7 +2176,10 @@ class ActivityStage(ttk.Frame):
     def load_theory(self):
         path = self.pick("Theoretical (DropletLab) CSV", [("CSV", "*.csv"), ("All files", "*")])
         if path:
-            self.safe(lambda: setattr(self, "theory", read_mfs_gradient(path)[:2]))
+            def work():
+                x, g, self.theory_pvap = read_theory_csv(path)
+                self.theory = (x, g)
+            self.safe(work)
 
     def load_experiment(self):
         path = self.pick("Experimental CSV", [("CSV", "*.csv"), ("All files", "*")])
@@ -1977,7 +2217,7 @@ class ActivityStage(ttk.Frame):
         self.refresh()
 
     def studio_data(self):
-        points = None if self.points is None else (*self.points, self.bounds)
+        points = None if self.points is None else (*self.points, self.bounds, self.unc)
         return {"AIOMFAC": self.curve, "Experiment": points}
 
     def open_studio(self):
@@ -1989,7 +2229,7 @@ class ActivityStage(ttk.Frame):
                   dict(name="Experiment", kind="points", label="Experiment", color="black", marker="square", size=5)]
         self.studio = PlotStudio(self.winfo_toplevel(), series, rf"$x_{{\mathrm{{{label}}}}}$",
                                  rf"$\gamma_{{\mathrm{{{label}}}}}$", "activity_coefficient.png",
-                                 self.xerr.get(), self.yerr.get())
+                                 self.xerr.get(), self.yerr.get(), self.band.get(), self.combined.get())
         self.studio.set_data(self.studio_data())
 
     def auto_limits(self):
@@ -1999,7 +2239,7 @@ class ActivityStage(ttk.Frame):
 
     def refresh(self):
         notes = []
-        self.points = self.curve = self.bounds = None
+        self.points = self.curve = self.bounds = self.unc = None
         if self.experiment is not None and self.theory is None:
             notes.append(f"{len(self.experiment[0])} experimental interval(s) ready; load the theoretical CSV.")
         if self.theory is not None and self.experiment is not None:
@@ -2017,6 +2257,10 @@ class ActivityStage(ttk.Frame):
                 notes.append(f"{zero} skipped (theoretical gradient ~ 0).")
             if np.any(gamma <= 0):
                 notes.append(f"{int(np.sum(gamma <= 0))} non-positive value(s) not shown on log axis.")
+            factors = pvap_factors(x, *self.theory, self.theory_pvap)
+            if factors is not None:
+                self.unc = pvap_bounds(gamma, self.bounds, factors, self.theory_pvap)
+                notes.append(pvap_note(self.unc))
         if self.tables is not None:
             try:
                 x, y, flagged = aiomfac_curve(self.tables, self.component.get())
@@ -2034,7 +2278,7 @@ class ActivityStage(ttk.Frame):
             notes.append(f"Limits ignored: {error}")
         self.info.set(" ".join(notes))
         draw_activity(self.ax, self.name.get().strip() or "A", self.points, self.curve, limits, self.bounds,
-                      self.xerr.get(), self.yerr.get())
+                      self.xerr.get(), self.yerr.get(), self.unc, self.band.get(), self.combined.get())
         self.fig.tight_layout()
         self.canvas.draw_idle()
         if self.studio is not None and self.studio.winfo_exists():
@@ -2050,11 +2294,7 @@ class ActivityStage(ttk.Frame):
         if not path:
             return
         try:
-            columns = {"MFS": self.points[0], "Activity coefficient": self.points[1]}
-            if self.bounds is not None:
-                columns.update(zip(("MFS min", "MFS max", "Activity coefficient min", "Activity coefficient max"),
-                                   self.bounds))
-            pd.DataFrame(columns).to_csv(path, index=False, float_format="%.10g")
+            activity_frame(*self.points, self.bounds, self.unc).to_csv(path, index=False, float_format="%.10g")
         except OSError as error:
             messagebox.showerror("Export failed", str(error), parent=self)
             return
