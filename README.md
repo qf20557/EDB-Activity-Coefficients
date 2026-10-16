@@ -16,4 +16,3 @@ READ FIRST:
 12. Choose the relevant AIOMFAC file from the dropdown menu
 13. Customise publication style plot
 14. Save to your device!
-	
