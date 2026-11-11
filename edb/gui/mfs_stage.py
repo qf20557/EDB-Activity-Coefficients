@@ -1,6 +1,7 @@
 """Stage 2 UI: MFS & gradients (EDB Fit Processing)."""
 import csv
 import math
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -11,12 +12,13 @@ from matplotlib.figure import Figure
 from matplotlib.widgets import SpanSelector
 
 from ..activity import sort_mfs_gradient
-from ..config import COMPOUNDS_PATH, CSV_COLUMNS, LIMIT_KEYS, MIN_POINTS, RADIUS_UNCERTAINTY_UM
+from ..config import COMPOUNDS_PATH, CSV_COLUMNS, LIMIT_KEYS, RADIUS_UNCERTAINTY_UM
 from ..fit_io import clean_fit_arrays, read_edb_csv, read_fit_csv
-from ..mfs import bin_edges, interval_results, make_mfs_function
-from ..parsing import parse_limits, parse_number
+from ..mfs import auto_bin_count, bin_edges, interval_results, make_mfs_function
+from ..parsing import parse_bin_width, parse_limits, parse_number, parse_stride
 from ..plotting import apply_limits
-from .widgets import nav_bar, scrollable
+from ..trace import Trace
+from .widgets import PointView, Progress, nav_bar, scrollable
 
 
 class MfsStage(ttk.Frame):
@@ -24,7 +26,7 @@ class MfsStage(ttk.Frame):
         super().__init__(master)
         self.app = app
         self.t = self.r2 = None
-        self.edb_t = self.edb_r2 = None
+        self.edb, self.edb_scale = None, 1.0  # cleaned points (a Trace) and the factor that corrects their radius
         self.mfs = self.mfs_minus = self.mfs_plus = None
         self.sigma = 0.0
         self.rows = []
@@ -41,10 +43,15 @@ class MfsStage(ttk.Frame):
 
         bar = ttk.Frame(root)
         bar.pack(fill="x", padx=4, pady=4)
-        for label, command in (("Load fit CSV", self.load_fit), ("Load cleaned EDB CSV", self.load_raw),
+        self.file_buttons = []  # disabled while a file is being read
+        for label, command in (("Load fit CSV", self.load_fit), ("Load cleaned EDB data", self.load_raw),
                                ("Calculate intervals", self.calculate), ("Export CSV", self.export),
                                ("Clear results", self.clear)):
-            ttk.Button(bar, text=label, command=command).pack(side="left", padx=2)
+            button = ttk.Button(bar, text=label, command=command)
+            button.pack(side="left", padx=2)
+            if command == self.load_raw:
+                self.file_buttons.append(button)
+        self.progress = Progress(bar)
         ttk.Label(root, textvariable=self.source, foreground="#555", wraplength=1150).pack(anchor="w", padx=6)
 
         panel = ttk.LabelFrame(root, text="Initial (wet) droplet composition", padding=6)
@@ -66,8 +73,9 @@ class MfsStage(ttk.Frame):
         self.field(panel, 2, 0, "Initial radius (um)", "")
         self.field(panel, 2, 1, "Interval start (s)", "")
         self.field(panel, 2, 2, "Interval end (s)", "")
-        self.field(panel, 3, 0, "Bin width (s, 0 = one interval)", "1000")
-        self.field(panel, 3, 1, "Plot every Nth EDB point", "20")
+        self.field(panel, 3, 0, "Bin width (s; auto ≈ 1000, 0 = one)", "auto").bind(
+            "<Return>", lambda _: self.draw(rescale=False))
+        self.field(panel, 3, 1, "Plot every Nth EDB point", "auto")
         self.field(panel, 3, 2, "Radius uncertainty (um)", f"{RADIUS_UNCERTAINTY_UM:g}").bind(
             "<Return>", lambda _: self.update_model())
         r0 = ttk.Frame(panel)
@@ -121,6 +129,7 @@ class MfsStage(ttk.Frame):
         self.span = SpanSelector(self.ax, self.on_span, "horizontal", useblit=True, interactive=False,
                                  props={"alpha": 0.2, "facecolor": "orange"})
         self.stride_entry.bind("<Return>", lambda _: self.draw(rescale=False))
+        self.view = PointView(self, self.ax, self.on_view)
 
         frame = ttk.Frame(root)
         frame.pack(fill="x", padx=4, pady=4)
@@ -165,12 +174,12 @@ class MfsStage(ttk.Frame):
     def receive(self, data):
         """Data handed over from stage 1, always on the corrected radius."""
         self.t, self.r2 = clean_fit_arrays(data["fit_t"], data["fit_r2"])
-        self.edb_t, self.edb_r2 = data["edb_t"], data["edb_r"] ** 2
+        self.edb, self.edb_scale = data["edb"], data["factor"]
         self.after_fit_loaded()
-        self.v["Initial radius (um)"].set(f"{data['edb_r'][0]:.8g}")
+        self.v["Initial radius (um)"].set(f"{self.edb.first()[1] * self.edb_scale:.8g}")
         self.v["Radius uncertainty (um)"].set(f"{data['sigma']:.6g}")
         refit = " (refitted on the corrected radius, same window)" if data["refitted"] else ""
-        self.source.set(f"From stage 1: {len(self.edb_t):,} cleaned points and a {len(self.t):,}-point fit{refit}, "
+        self.source.set(f"From stage 1: {self.edb.count:,} cleaned points and a {len(self.t):,}-point fit{refit}, "
                         f"refractive-index corrected radius (factor {data['factor']:.4f}), uncertainty "
                         f"±{data['sigma']:.4g} um. Initial radius set from the first cleaned point (editable).")
         self.clear()
@@ -197,22 +206,31 @@ class MfsStage(ttk.Frame):
         self.update_model(rescale=True)
 
     def load_raw(self):
-        path = filedialog.askopenfilename(title="Cleaned EDB CSV", filetypes=[("CSV", "*.csv"), ("All files", "*")],
-                                          parent=self)
+        """Read cleaned EDB data (CSV or .npz saved by stage 1) on a background thread."""
+        path = filedialog.askopenfilename(title="Cleaned EDB data", parent=self, filetypes=[
+            ("Cleaned data", "*.csv *.npz"), ("All files", "*")])
         if not path:
             return
-        try:
-            t, r, sigma = read_edb_csv(path)
-        except Exception as error:
-            messagebox.showerror("EDB CSV error", str(error), parent=self)
-            return
-        self.edb_t, self.edb_r2 = t, r * r
-        self.v["Initial radius (um)"].set(f"{r[0]:.8g}")
-        self.status.set(f"EDB file: {len(t):,} points. First point t = {t[0]:.6g} s, corrected radius = "
-                        f"{r[0]:.6g} um (set as initial radius; editable). Read from radius_corrected_um saved by "
-                        "stage 1." + self.take_sigma(sigma))
-        self.clear()
-        self.update_model(rescale=True)
+        started = time.perf_counter()
+
+        def work(progress, cancel):
+            t, r, sigma = read_edb_csv(path, progress, cancel)
+            return Trace(t, r), sigma
+
+        def done(result):
+            self.edb, sigma = result
+            self.edb_scale = 1.0
+            t0, r0 = self.edb.first()
+            self.v["Initial radius (um)"].set(f"{r0:.8g}")
+            self.status.set(f"EDB file: {len(self.edb):,} points read in {time.perf_counter() - started:.1f} s. "
+                            f"First point t = {t0:.6g} s, corrected radius = {r0:.6g} um (set as initial radius; "
+                            "editable). Read from the corrected radius saved by stage 1." + self.take_sigma(sigma))
+            self.clear()
+            self.update_model(rescale=True)
+
+        self.progress.run("Loading", work, done,
+                          lambda error: messagebox.showerror("EDB data error", str(error) or repr(error), parent=self),
+                          lambda: self.status.set("Load cancelled."), lock=self.file_buttons)
 
     def take_sigma(self, sigma):
         """Use the radius uncertainty stored in a loaded CSV; returns a note for the status line."""
@@ -222,10 +240,10 @@ class MfsStage(ttk.Frame):
         return f" Radius uncertainty ±{sigma:.4g} um taken from the file."
 
     def r0_from_edb(self):
-        if self.edb_r2 is None:
+        if self.edb is None:
             messagebox.showinfo("No EDB data", "No cleaned EDB data loaded.", parent=self)
             return
-        self.v["Initial radius (um)"].set(f"{math.sqrt(self.edb_r2[0]):.8g}")
+        self.v["Initial radius (um)"].set(f"{self.edb.first()[1] * self.edb_scale:.8g}")
         self.update_model()
 
     def r0_from_fit(self):
@@ -317,19 +335,30 @@ class MfsStage(ttk.Frame):
         self.v["Interval end (s)"].set(f"{min(hi, self.t[-1]):.8g}")
         self.draw(rescale=False)
 
+    def draw_points(self, whole=False, force=True):
+        """Put the EDB points to draw on the plot: those in the current x range, or of the whole trace. Returns
+        False (and leaves the plot alone) if force is off and they are the ones already drawn."""
+        if self.edb is None:
+            self.line_edb.set_data([], [])
+            return True
+        try:
+            stride = parse_stride(self.get("Plot every Nth EDB point"))
+        except ValueError:
+            stride = None
+            self.status.set("Plot every Nth point must be 'auto' or a positive whole number; using auto.")
+        t, r, changed = self.view.get(self.edb, stride, whole)
+        if changed or force:
+            self.line_edb.set_data(t, (r * self.edb_scale) ** 2)
+        return changed or force
+
+    def on_view(self):
+        """The x range has settled after a zoom or pan: draw the points of the new range."""
+        if self.edb is not None and self.draw_points(force=False):
+            self.canvas.draw_idle()
+
     def draw(self, rescale=False):
         ax = self.ax
-        try:
-            stride = int(self.get("Plot every Nth EDB point"))
-            if stride < 1:
-                raise ValueError
-        except ValueError:
-            stride = 1
-            self.status.set("Plot every Nth point must be a positive whole number; using 1.")
-        if self.edb_t is not None:
-            self.line_edb.set_data(self.edb_t[::stride], self.edb_r2[::stride])
-        else:
-            self.line_edb.set_data([], [])
+        self.draw_points(whole=rescale)
         if self.band is not None:
             self.band.remove()
             self.band = None
@@ -348,7 +377,7 @@ class MfsStage(ttk.Frame):
         if self.t is not None:
             try:
                 lo, hi = self.num("Interval start (s)", "start"), self.num("Interval end (s)", "end")
-                width = self.num("Bin width (s, 0 = one interval)", "bin width")
+                width = parse_bin_width(self.get("Bin width (s; auto ≈ 1000, 0 = one)"))
                 self.edge_lines = [ax.axvline(e, color="orange", alpha=0.4, linewidth=0.8, zorder=1)
                                    for e in bin_edges(lo, hi, width)]
             except ValueError:
@@ -363,7 +392,7 @@ class MfsStage(ttk.Frame):
             apply_limits(ax, b[2], b[3], "y")
         except ValueError as error:
             self.status.set(f"Axis limits ignored: {error}")
-        if self.t is not None or self.edb_t is not None:
+        if self.t is not None or self.edb is not None:
             ax.legend(loc="best", fontsize=8)
         self.canvas.draw_idle()
 
@@ -378,9 +407,9 @@ class MfsStage(ttk.Frame):
         try:
             lo = self.num("Interval start (s)", "Interval start")
             hi = self.num("Interval end (s)", "Interval end")
-            width = self.num("Bin width (s, 0 = one interval)", "Bin width")
+            width = parse_bin_width(self.get("Bin width (s; auto ≈ 1000, 0 = one)"))
             lo, hi = max(lo, self.t[0]), min(hi, self.t[-1])
-            rows, skipped = interval_results(self.t, self.scenarios(), lo, hi, width)
+            rows, skipped, resampled = interval_results(self.t, self.scenarios(), lo, hi, width)
         except ValueError as error:
             messagebox.showerror("Calculation error", str(error), parent=self)
             return False
@@ -389,10 +418,15 @@ class MfsStage(ttk.Frame):
         for row in rows:
             self.table.insert("", "end", values=tuple("" if math.isnan(v) else f"{v:.6g}" for v in row))
         message = f"{len(rows)} interval(s) calculated"
+        if width is None:
+            message += f" (automatic: {auto_bin_count(lo, hi)} equal bin(s) of {(hi - lo) / auto_bin_count(lo, hi):.6g} s)"
         message += f" with ±{self.sigma:.4g} um radius uncertainty." if self.sigma else " (no radius uncertainty)."
         if skipped:
-            message += (f" {skipped} skipped (fewer than {MIN_POINTS} fit points, or A would be negative "
-                        "i.e. radius below the B-only radius).")
+            message += (f" {skipped} skipped: A would be negative there (fitted radius below the B-only radius "
+                        "for this composition and initial radius).")
+        if resampled:
+            message += (f" {resampled} bin(s) are narrower than the spacing of the fit points, so the fit was "
+                        "interpolated inside them.")
         partial = sum(any(math.isnan(v) for v in row) for row in rows)
         if partial:
             message += f" {partial} interval(s) have no value for a shifted radius (A would be negative there)."
@@ -426,6 +460,9 @@ class MfsStage(ttk.Frame):
             writer.writerows(self.rows)
 
     def handoff(self):
+        if self.progress.busy:
+            messagebox.showinfo("Busy", "Wait for the file to finish loading first.", parent=self)
+            return None
         if not self.rows:
             if not messagebox.askyesno("No intervals", "No intervals calculated yet. Calculate them now with the "
                                        "current settings?", parent=self):

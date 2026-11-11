@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-STAGE1 = ["edb.raw_data", "edb.culling", "edb.optics", "edb.fitting", "edb.parsing", "edb.compounds"]
+STAGE1 = ["edb.raw_data", "edb.trace", "edb.culling", "edb.optics", "edb.fitting", "edb.parsing", "edb.compounds"]
 OTHERS = ["edb.fit_io", "edb.mfs", "edb.activity", "edb.aiomfac", "edb.plotting"]
 
 

@@ -5,7 +5,9 @@ import pytest
 
 from edb.config import RADIUS_UNCERTAINTY_UM
 from edb.fit_io import read_edb_csv, read_fit_csv
+from edb.fitting import export_points
 from edb.mfs import bin_edges, interval_results, make_mfs_function
+from edb.parsing import parse_bin_width
 
 RECORDS = {"A": dict(density_g_ml=1.6, molar_mass_g_mol=104.0), "B": dict(density_g_ml=1.1, molar_mass_g_mol=1228.0),
            "W": dict(density_g_ml=1.0, molar_mass_g_mol=18.0)}
@@ -45,8 +47,38 @@ def test_interval_gradients():
     t = np.linspace(0, 100, 101)
     r2 = 400 - 0.5 * t
     mfs = lambda values: np.full(len(values), 0.3)
-    rows, skipped = interval_results(t, [(r2, mfs)] * 3, 0, 100, 25)
-    assert len(rows) == 4 and skipped == 0
+    rows, skipped, resampled = interval_results(t, [(r2, mfs)] * 3, 0, 100, 25)
+    assert len(rows) == 4 and skipped == 0 and resampled == 0
     np.testing.assert_allclose(np.asarray(rows)[:, [1, 3, 5]], -0.5)
     np.testing.assert_allclose(np.asarray(rows)[:, [0, 2, 4]], 0.3)
     np.testing.assert_array_equal(bin_edges(0, 10, 4), [0, 4, 8, 10])
+
+
+def test_automatic_bins_fill_the_interval():
+    np.testing.assert_allclose(bin_edges(500, 3500), [500, 1500, 2500, 3500])  # exact multiple: 1000 s bins
+    edges = bin_edges(200, 4600)  # 4400 s: four equal bins of 1100 s, no short bin at the end
+    np.testing.assert_allclose(edges, [200, 1300, 2400, 3500, 4600])
+    assert len(bin_edges(0, 1400)) == 2 and len(bin_edges(0, 1600)) == 3 and len(bin_edges(0, 300)) == 2
+    assert bin_edges(0, 7321.5)[-1] == 7321.5
+    t = np.linspace(0, 4400, 4401)
+    rows, skipped, resampled = interval_results(t, [(400 - 0.05 * t, lambda v: np.full(len(v), 0.3))] * 3, 0, 4400)
+    assert len(rows) == 4 and skipped == 0 and resampled == 0
+
+
+def test_bins_narrower_than_the_fit_spacing_are_not_skipped():
+    """A 1000-point fit of a week-long trace has a point every 600 s: 1000 s bins hold one or two of them."""
+    t = np.linspace(0, 600000, 1001)
+    r2 = 900 * np.exp(-t / 3000000)
+    mfs, _ = make_mfs_function(RECORDS, "A", "B", "W", 1.0, 1.0, 0.0, 30.0)
+    rows, skipped, resampled = interval_results(t, [(r2, mfs)] * 3, 0, 600000)
+    assert len(rows) == 600 and skipped == 0 and resampled == 600
+    rows = np.asarray(rows)
+    centres = np.arange(500, 600000, 1000)
+    np.testing.assert_allclose(rows[:, 1], -900 / 3000000 * np.exp(-centres / 3000000), rtol=1e-3)  # d(r2)/dt
+    np.testing.assert_allclose(rows[:, 0], mfs(900 * np.exp(-centres / 3000000)), rtol=1e-3)
+    dense = np.linspace(0, 600000, 60001)  # the same curve sampled every 10 s needs no interpolation
+    rows_dense, skipped, resampled = interval_results(dense, [(900 * np.exp(-dense / 3000000), mfs)] * 3, 0, 600000)
+    assert skipped == 0 and resampled == 0
+    np.testing.assert_allclose(rows, np.asarray(rows_dense), rtol=1e-3)
+    assert export_points(dict(lo=0.0, hi=600000.0)) == 60001 and export_points(dict(lo=0.0, hi=5000.0)) == 1000
+    assert parse_bin_width(" Auto ") is None and parse_bin_width("") is None and parse_bin_width("250") == 250.0

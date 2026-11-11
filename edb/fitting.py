@@ -3,7 +3,8 @@ import math
 
 import numpy as np
 
-from .config import DICT_TAUS, MAX_FIT_BINS
+from .config import DICT_TAUS, FIT_EXPORT_POINTS, FIT_EXPORT_STEP, MAX_FIT_BINS, MAX_FIT_EXPORT_POINTS
+from .trace import Trace
 
 
 def _nnls(A, b):
@@ -33,15 +34,21 @@ def _nnls(A, b):
 
 
 def bin_series(t, y, max_bins=MAX_FIT_BINS):
+    """(time, mean, count, within-bin sum of squares) for arrays; fit_trace does the same block by block."""
     if len(t) <= max_bins:
         return t, y, np.ones(len(t)), 0.0
-    lo, hi = float(t.min()), float(t.max())
-    idx = np.minimum(((t - lo) / (hi - lo) * max_bins).astype(np.int64), max_bins - 1)
-    count = np.bincount(idx, minlength=max_bins).astype(float)
+    return _bin_blocks([(t, y)], float(t.min()), float(t.max()), max_bins)
+
+
+def _bin_blocks(blocks, lo, hi, max_bins=MAX_FIT_BINS):
+    count, sum_t, sum_y, sum_yy = (np.zeros(max_bins) for _ in range(4))
+    for t, y in blocks:
+        idx = np.minimum(((t - lo) / (hi - lo) * max_bins).astype(np.int64), max_bins - 1)
+        count += np.bincount(idx, minlength=max_bins)
+        sum_t += np.bincount(idx, weights=t, minlength=max_bins)
+        sum_y += np.bincount(idx, weights=y, minlength=max_bins)
+        sum_yy += np.bincount(idx, weights=y * y, minlength=max_bins)
     keep = count > 0
-    sum_t = np.bincount(idx, weights=t, minlength=max_bins)
-    sum_y = np.bincount(idx, weights=y, minlength=max_bins)
-    sum_yy = np.bincount(idx, weights=y * y, minlength=max_bins)
     mean_y = np.where(keep, sum_y / np.where(keep, count, 1), 0.0)
     within = float(np.sum(sum_yy - count * mean_y ** 2))
     return (sum_t / np.where(keep, count, 1))[keep], mean_y[keep], count[keep], max(within, 0.0)
@@ -56,18 +63,35 @@ def _solve_decays(u, y, sw, taus):
 
 
 def fit_model(t, r, lo=None, hi=None):
-    lo = t.min() if lo is None else lo
-    hi = t.max() if hi is None else hi
+    """Fit arrays of time and radius; see fit_trace."""
+    return fit_trace(Trace(t, r), lo, hi)
+
+
+def fit_trace(trace, lo=None, hi=None, scale=1.0):
+    """Fit scale * radius of the retained rows of a Trace with lo <= t <= hi. The trace is read in blocks (once to
+    count, once to bin), so no copy of it is made however long it is."""
+    first, last = trace.time_range()
+    lo = first if lo is None else lo
+    hi = last if hi is None else hi
     if lo >= hi:
         raise ValueError("Fit start must be below fit end.")
-    mask = (t >= lo) & (t <= hi)
-    n = int(mask.sum())
-    tt, rr = t[mask], r[mask]
-    if n < 10 or len(np.unique(tt)) < 10:
+
+    n, t_lo, t_hi, distinct, small = 0, math.inf, -math.inf, np.empty(0), []
+    for tt, rr in trace.blocks(lo, hi):
+        n += len(tt)
+        t_lo, t_hi = min(t_lo, float(tt.min())), max(t_hi, float(tt.max()))
+        if len(distinct) < 10:
+            distinct = np.unique(np.concatenate([distinct, tt]))
+        if n <= MAX_FIT_BINS:
+            small.append((tt, rr * scale))
+    if n < 10 or len(distinct) < 10:
         raise ValueError("Need at least 10 retained points at distinct times for this model.")
-    t_lo, t_hi = float(tt.min()), float(tt.max())
     span = t_hi - t_lo
-    tb, rb, wb, within = bin_series(tt, rr)
+    if n <= MAX_FIT_BINS:
+        tb, rb = (np.concatenate(column) for column in zip(*small))
+        wb, within = np.ones(n), 0.0
+    else:
+        tb, rb, wb, within = _bin_blocks(((tt, rr * scale) for tt, rr in trace.blocks(lo, hi)), t_lo, t_hi)
     u, sw = (tb - t_lo) / span, np.sqrt(wb)
     offset, amps, _ = _solve_decays(u, rb, sw, DICT_TAUS)
     used = amps > 0
@@ -86,6 +110,12 @@ def fit_model(t, r, lo=None, hi=None):
     ss_tot = float(np.sum(wb * (rb - mean) ** 2)) + within
     return dict(func=func, label="Monotone convex fit", lo=t_lo, hi=t_hi, n=n, rms=math.sqrt(ss_res / n),
                 r2=(1 - ss_res / ss_tot) if ss_tot > 0 else float("nan"), detail=detail)
+
+
+def export_points(fit):
+    """How many points the exported fit has: FIT_EXPORT_POINTS, or more on a long trace (see config)."""
+    by_step = math.ceil((fit["hi"] - fit["lo"]) / FIT_EXPORT_STEP) + 1
+    return int(min(MAX_FIT_EXPORT_POINTS, max(FIT_EXPORT_POINTS, by_step)))
 
 
 def fit_curve(fit, points=800):

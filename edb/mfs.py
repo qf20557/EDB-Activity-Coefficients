@@ -3,7 +3,7 @@ import math
 
 import numpy as np
 
-from .config import MAX_BINS, MIN_POINTS
+from .config import AUTO_BIN_SECONDS, BIN_RESAMPLE_POINTS, MAX_BINS, MIN_POINTS
 
 
 def make_mfs_function(records, name_a, name_b, name_s, mass_a, mass_b, mass_s, r0):
@@ -33,9 +33,19 @@ def make_mfs_function(records, name_a, name_b, name_s, mass_a, mass_b, mass_s, r
     return mfs, info
 
 
-def bin_edges(lo, hi, width):
+def auto_bin_count(lo, hi, target=AUTO_BIN_SECONDS):
+    """How many equal bins of about `target` seconds fill the interval (at least one)."""
+    return max(1, round((hi - lo) / target))
+
+
+def bin_edges(lo, hi, width=None):
+    """Bin edges from lo to hi. width None (automatic): equal bins that fill the interval exactly, as many as makes
+    each closest to AUTO_BIN_SECONDS. A width: bins of that width from lo, the last one shorter if it does not
+    divide the interval; 0 gives a single interval."""
     if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
         raise ValueError("Interval start must be below interval end.")
+    if width is None:
+        return np.linspace(lo, hi, auto_bin_count(lo, hi) + 1)
     if not math.isfinite(width) or width < 0:
         raise ValueError("Bin width must be zero (single interval) or positive.")
     if width == 0:
@@ -45,28 +55,41 @@ def bin_edges(lo, hi, width):
     return np.r_[np.arange(lo, hi, width), hi]
 
 
-def interval_results(t, scenarios, lo, hi, width):
-    """scenarios: [(r2, mfs), ...], nominal first (then radius - uncertainty, radius + uncertainty). Each row holds
-    (average MFS, gradient) for every scenario in turn. A bin is skipped when the nominal scenario is invalid there;
-    another scenario that is invalid in a kept bin gives NaN for that bin."""
+def interval_results(t, scenarios, lo, hi, width=None):
+    """Returns (rows, skipped, resampled). scenarios: [(r2, mfs), ...], nominal first (then radius - uncertainty,
+    radius + uncertainty). Each row holds (average MFS, gradient) for every scenario in turn. A bin is skipped only
+    when the nominal scenario is invalid there (A would be negative); another scenario that is invalid in a kept bin
+    gives NaN for that bin. A bin holding fewer than MIN_POINTS fit points (a fit sampled more coarsely than the
+    bins) is not skipped: the fit is interpolated at BIN_RESAMPLE_POINTS evenly spaced times across it; resampled
+    counts those bins."""
     x_all = [mfs(r2) for r2, mfs in scenarios]
     edges = bin_edges(lo, hi, width)
-    rows, skipped = [], 0
+    rows, skipped, resampled = [], 0, 0
     for j, (a, b) in enumerate(zip(edges[:-1], edges[1:])):
         last = j == len(edges) - 2
         mask = (t >= a) & ((t <= b) if last else (t < b))
         tt = t[mask]
-        if len(tt) < MIN_POINTS or np.any(~np.isfinite(x_all[0][mask])):
+        sparse = len(tt) < MIN_POINTS
+        if sparse:
+            tt = np.linspace(max(a, t[0]), min(b, t[-1]), BIN_RESAMPLE_POINTS)
+            if tt[-1] <= tt[0]:  # the bin lies outside the fit
+                skipped += 1
+                continue
+            values = [np.interp(tt, t, r2) for r2, _ in scenarios]
+            samples = [(r2, mfs(r2)) for r2, (_, mfs) in zip(values, scenarios)]
+        else:
+            samples = [(r2[mask], x[mask]) for (r2, _), x in zip(scenarios, x_all)]
+        if np.any(~np.isfinite(samples[0][1])):
             skipped += 1
             continue
+        resampled += sparse
         span = tt[-1] - tt[0]
         row = []
-        for (r2, _), x in zip(scenarios, x_all):
-            yy, xx = r2[mask], x[mask]
+        for yy, xx in samples:
             if np.all(np.isfinite(xx)) and np.all(np.isfinite(yy)):
                 row += [float(np.sum(0.5 * (xx[1:] + xx[:-1]) * np.diff(tt)) / span),
                         float(np.polyfit(tt - tt.mean(), yy, 1)[0])]
             else:
                 row += [math.nan, math.nan]
         rows.append(tuple(row))
-    return rows, skipped
+    return rows, skipped, resampled

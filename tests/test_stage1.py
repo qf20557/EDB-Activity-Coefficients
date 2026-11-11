@@ -13,16 +13,16 @@ def test_read_files_continues_time_across_files(tmp_path):
     first, second = tmp_path / "a.txt", tmp_path / "b.txt"
     first.write_text("time radius\n10 5.0\n11 4.9\n12 4.8\n")
     second.write_text("0, 4.7\n1, 4.6\nbad line\n")
-    data, skipped = read_files([first, second])
-    np.testing.assert_array_equal(data[:, 0], [0, 1, 2, 3, 4])
-    np.testing.assert_array_equal(data[:, 1], [5.0, 4.9, 4.8, 4.7, 4.6])
+    t, r, skipped = read_files([first, second])
+    np.testing.assert_array_equal(t, [0, 1, 2, 3, 4])
+    np.testing.assert_array_equal(r, [5.0, 4.9, 4.8, 4.7, 4.6])
     assert skipped == 2
     with pytest.raises(ValueError):
         read_files([])
 
 
 def test_cull_undo_restore():
-    store = PointStore(np.column_stack([np.arange(10.0), np.full(10, 2.0)]))
+    store = PointStore(np.arange(10.0), np.full(10, 2.0))
     assert store.cull_box((2, 4, 0, 10), squared=False) == 3
     assert store.cull_box((5, 9, 3.5, 4.5), squared=True) == 5  # radius 2 -> radius² 4
     with pytest.raises(ValueError):

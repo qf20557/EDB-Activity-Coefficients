@@ -1,5 +1,6 @@
 """Stage 1 UI: Clean & fit (EDB Plotter)."""
 import csv
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -9,14 +10,14 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.widgets import RectangleSelector, SpanSelector
 
-from ..config import EDB_ASSUMED_RI, FIT_EXPORT_POINTS, MAX_ERROR_BARS, RADIUS_UNCERTAINTY_UM
+from ..config import EDB_ASSUMED_RI, MAX_ERROR_BARS, RADIUS_UNCERTAINTY_UM
 from ..culling import PointStore
-from ..fitting import fit_curve, fit_model
+from ..fitting import export_points, fit_curve, fit_trace
 from ..optics import correction_factor
-from ..parsing import parse_limits, parse_number
+from ..parsing import file_size, parse_limits, parse_number, parse_stride
 from ..plotting import apply_limits
-from ..raw_data import read_files
-from .widgets import nav_bar, scrollable
+from ..raw_data import read_files, write_cleaned
+from .widgets import PointView, Progress, nav_bar, scrollable
 
 
 MODE_HELP = {
@@ -36,7 +37,7 @@ class CleanFitStage(ttk.Frame):
         self.fit = None
         self.fit_band = None
         self.var = {name: tk.StringVar(value=value) for name, value in (
-            ("stride", "20"), ("fit_lo", ""), ("fit_hi", ""),
+            ("stride", "auto"), ("fit_lo", ""), ("fit_hi", ""),
             ("x_min", ""), ("x_max", ""), ("y_min", ""), ("y_max", ""))}
         self.squared = tk.BooleanVar(value=False)
         self.use_err = tk.BooleanVar(value=False)
@@ -46,8 +47,8 @@ class CleanFitStage(ttk.Frame):
         self.show_raw = tk.BooleanVar(value=True)
         self.show_corr = tk.BooleanVar(value=False)
         self.mode = tk.StringVar(value="fit")
-        self.status = tk.StringVar(value="Add raw EDB files or a cleaned CSV (in acquisition order), then click "
-                                         "Load / plot.")
+        self.status = tk.StringVar(value="Add raw EDB files or cleaned data (in acquisition order), then click "
+                                         "Load / plot. Files of several GB are fine: they load in the background.")
         self.fit_text = tk.StringVar(value="Fit: none yet.")
         self.build()
 
@@ -81,6 +82,8 @@ class CleanFitStage(ttk.Frame):
         entry = ttk.Entry(opts, textvariable=self.var["stride"], width=7)
         entry.grid(row=2, column=1, sticky="w")
         entry.bind("<Return>", lambda _: self.update_plot())
+        ttk.Label(opts, text="(auto = thinned to fit the screen, spikes kept; zoom in for every point)").grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=(4, 0))
         ttk.Label(opts, text="Fit from (s)").grid(row=3, column=0, sticky="w")
         ttk.Entry(opts, textvariable=self.var["fit_lo"], width=10).grid(row=3, column=1, sticky="w")
         ttk.Label(opts, text="to (s)").grid(row=3, column=2, sticky="e")
@@ -111,10 +114,15 @@ class CleanFitStage(ttk.Frame):
 
         act = ttk.Frame(content, padding=(6, 0))
         act.pack(fill="x")
+        self.file_buttons = []  # disabled while a file is being read or written
         for text, command in (("Load / plot", self.load), ("Fit", self.do_fit),
                               ("Clear fit region", self.clear_region), ("Save cleaned data", self.save_altered),
                               ("Export fit CSV", self.export_fit)):
-            ttk.Button(act, text=text, command=command).pack(side="left", padx=2, pady=3)
+            button = ttk.Button(act, text=text, command=command)
+            button.pack(side="left", padx=2, pady=3)
+            if command in (self.load, self.save_altered):
+                self.file_buttons.append(button)
+        self.progress = Progress(act)
 
         modes = ttk.LabelFrame(content, text="Plot mode (drag on the plot)", padding=4)
         modes.pack(fill="x", padx=6, pady=2)
@@ -157,20 +165,28 @@ class CleanFitStage(ttk.Frame):
                                       spancoords="pixels", interactive=False,
                                       props=dict(facecolor="orange", edgecolor="darkorange", alpha=0.25))
         self.rect.set_active(False)
+        self.view = PointView(self, self.axis, self.on_view)
         self.update_plot(rescale=True)
 
     # file list
     def refresh_list(self):
         self.listbox.delete(0, tk.END)
         for i, path in enumerate(self.files, 1):
-            self.listbox.insert(tk.END, f"{i:02d}. {Path(path).name}")
+            try:
+                size = f"  ({file_size(Path(path).stat().st_size)})"
+            except OSError:
+                size = ""
+            self.listbox.insert(tk.END, f"{i:02d}. {Path(path).name}{size}")
 
     def add_files(self):
-        for path in filedialog.askopenfilenames(title="Select EDB files or a cleaned CSV", filetypes=[
-                ("Data files", "*.txt *.dat *.csv"), ("All files", "*")]):
+        for path in filedialog.askopenfilenames(title="Select EDB files or cleaned data", filetypes=[
+                ("Data files", "*.txt *.dat *.csv *.npz"), ("All files", "*")]):
             if path not in self.files:
                 self.files.append(path)
         self.refresh_list()
+        if self.files:
+            self.status.set(f"{len(self.files)} file(s) listed. Put them in acquisition order, then click "
+                            "Load / plot.")
 
     def remove_files(self):
         for i in reversed(self.listbox.curselection()):
@@ -192,17 +208,26 @@ class CleanFitStage(ttk.Frame):
             self.listbox.selection_set(j)
 
     def load(self):
-        try:
-            data, skipped = read_files(self.files)
-        except Exception as error:
-            messagebox.showerror("Load error", str(error), parent=self)
-            return
-        self.store = PointStore(data)
-        self.fit = None
-        self.status.set(f"Loaded {len(data):,} points from {len(self.files)} file(s); skipped {skipped:,} "
-                        "non-data lines. Radius assumed in µm; time starts at 0 s.")
-        self.fit_text.set("Fit: none yet. Drag in Fit region mode or click Fit for the whole trace.")
-        self.update_plot(rescale=True)
+        """Read the listed files on a background thread; the previous data stays on screen until it is done."""
+        files, started = list(self.files), time.perf_counter()
+
+        def work(progress, cancel):
+            t, r, skipped = read_files(files, progress, cancel)
+            return PointStore(t, r), skipped
+
+        def done(result):
+            self.store, skipped = result
+            self.fit = None
+            self.status.set(f"Loaded {len(self.store):,} points from {len(files)} file(s) in "
+                            f"{time.perf_counter() - started:.1f} s; skipped {skipped:,} non-data lines. Radius "
+                            "assumed in µm; time starts at 0 s.")
+            self.fit_text.set("Fit: none yet. Drag in Fit region mode or click Fit for the whole trace.")
+            self.update_plot(rescale=True)
+
+        self.progress.run("Loading", work, done,
+                          lambda error: messagebox.showerror("Load error", str(error) or repr(error), parent=self),
+                          lambda: self.status.set("Load cancelled; the previous data (if any) is unchanged."),
+                          lock=self.file_buttons)
 
     # modes and correction
     def set_mode(self):
@@ -262,8 +287,7 @@ class CleanFitStage(ttk.Frame):
         factor = self.factor()
         if self.fit["scale"] == factor:
             return self.fit
-        t, r = self.store.active()
-        fit = fit_model(t, r * factor, self.fit["lo"], self.fit["hi"])
+        fit = fit_trace(self.store, self.fit["lo"], self.fit["hi"], factor)
         fit["scale"] = factor
         return fit
 
@@ -302,7 +326,7 @@ class CleanFitStage(ttk.Frame):
         return self.factor() if self.show_corr.get() and not self.show_raw.get() else 1.0
 
     def after_edit(self):
-        total, kept = len(self.store.data), int(self.store.keep.sum())
+        total, kept = len(self.store), self.store.count
         self.status.set(f"{kept:,} retained / {total:,} loaded points; {total - kept:,} culled. "
                         "Source files unchanged.")
         if self.fit is not None:
@@ -326,38 +350,26 @@ class CleanFitStage(ttk.Frame):
         if self.store is None:
             messagebox.showinfo("No data", "Load data first.", parent=self)
             return
-        if self.require_correction("saving") is None:
+        factor = self.require_correction("saving")
+        if factor is None:
             return
-        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
-                                            initialfile="Cleaned EDB Data.csv", parent=self)
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", initialfile="Cleaned EDB Data", parent=self,
+            filetypes=[("CSV", "*.csv"), ("NumPy binary: saves and reloads large data in seconds", "*.npz")])
         if not path:
             return
         if any(Path(path).exists() and Path(path).samefile(p) for p in self.files):
             messagebox.showerror("Input selected", "Choose an output file different from the inputs.", parent=self)
             return
-        try:
-            count, factor = self.write_cleaned(path)
-        except OSError as error:
-            messagebox.showerror("Save failed", str(error), parent=self)
-            return
-        self.status.set(f"Saved {count:,} retained rows (correction factor {factor:.4f}).")
-
-    def write_cleaned(self, path):
-        t, r = self.store.active()
-        factor = self.factor()
-        rc = r * factor
-        with open(path, "w", newline="", encoding="utf-8") as handle:
-            writer = csv.writer(handle)
-            if self.use_err.get():
-                sigma = RADIUS_UNCERTAINTY_UM * factor
-                writer.writerow(["time_s", "radius_raw_um", "radius_corrected_um",
-                                 "radius_corrected_err_um", "radius_corrected_squared_um2",
-                                 "radius_corrected_squared_err_um2"])
-                writer.writerows(zip(t, r, rc, np.full_like(rc, sigma), rc * rc, 2 * rc * sigma))
-            else:
-                writer.writerow(["time_s", "radius_raw_um", "radius_corrected_um"])
-                writer.writerows(zip(t, r, rc))
-        return len(t), factor
+        trace = self.store.snapshot()  # points culled while the file is being written do not change it
+        sigma = RADIUS_UNCERTAINTY_UM * factor if self.use_err.get() else None
+        started = time.perf_counter()
+        self.progress.run(
+            "Saving", lambda progress, cancel: write_cleaned(path, trace, factor, sigma, progress, cancel),
+            lambda count: self.status.set(f"Saved {count:,} retained rows to {Path(path).name} in "
+                                          f"{time.perf_counter() - started:.1f} s (correction factor {factor:.4f})."),
+            lambda error: messagebox.showerror("Save failed", str(error) or repr(error), parent=self),
+            lambda: self.status.set("Save cancelled; no file was written."), lock=self.file_buttons)
 
     def number(self, key, label):
         return parse_number(self.var[key].get(), label, optional=True)
@@ -373,8 +385,7 @@ class CleanFitStage(ttk.Frame):
             return
         try:
             scale = self.fit_scale()
-            t, r = self.store.active()
-            self.fit = fit_model(t, r * scale, self.number("fit_lo", "Fit from"), self.number("fit_hi", "Fit to"))
+            self.fit = fit_trace(self.store, self.number("fit_lo", "Fit from"), self.number("fit_hi", "Fit to"), scale)
             self.fit["scale"] = scale
         except ValueError as error:
             self.fit = None
@@ -408,10 +419,11 @@ class CleanFitStage(ttk.Frame):
         except OSError as error:
             messagebox.showerror("Export error", str(error), parent=self)
             return
-        self.status.set(f"Corrected-radius fit exported ({FIT_EXPORT_POINTS} points, factor {fit['scale']:.4f}).")
+        self.status.set(f"Corrected-radius fit exported ({export_points(fit):,} points, factor "
+                        f"{fit['scale']:.4f}).")
 
     def write_fit(self, path, fit):
-        x, radius, radius2 = fit_curve(fit, FIT_EXPORT_POINTS)
+        x, radius, radius2 = fit_curve(fit, export_points(fit))
         header = ["time_s", "fitted_radius_corrected_um", "fitted_radius_corrected_squared_um2",
                   "radius_correction_factor"]
         columns = [x, radius, radius2, np.full_like(x, fit["scale"])]
@@ -428,7 +440,11 @@ class CleanFitStage(ttk.Frame):
             writer.writerows(zip(*columns))
 
     def handoff(self):
-        """Data for stage 2: cleaned points and fit, both always on the corrected radius."""
+        """Data for stage 2: the fit on the corrected radius, and the cleaned points (raw radius, shared with this
+        stage rather than copied) with the correction factor to apply to them."""
+        if self.progress.busy:
+            messagebox.showinfo("Busy", "Wait for the file to finish loading or saving first.", parent=self)
+            return None
         if self.store is None:
             messagebox.showinfo("No data", "Load EDB data first.", parent=self)
             return None
@@ -444,10 +460,57 @@ class CleanFitStage(ttk.Frame):
         except ValueError as error:
             messagebox.showerror("Fit error", f"Could not fit the corrected radius: {error}", parent=self)
             return None
-        t, r = self.store.active()
-        x, _, radius2 = fit_curve(fit, FIT_EXPORT_POINTS)
-        return dict(edb_t=t.copy(), edb_r=r * factor, fit_t=x, fit_r2=radius2, factor=factor,
+        x, _, radius2 = fit_curve(fit, export_points(fit))
+        return dict(edb=self.store.snapshot(), fit_t=x, fit_r2=radius2, factor=factor,
                     sigma=RADIUS_UNCERTAINTY_UM * factor, refitted=fit is not self.fit)
+
+    def stride(self):
+        try:
+            return parse_stride(self.var["stride"].get())
+        except ValueError:
+            self.status.set("Plot every Nth point must be 'auto' or a positive whole number; using auto.")
+            return None
+
+    def draw_points(self, whole=False, force=True):
+        """Put the points to draw on the plot: those in the current x range, or of the whole trace. Returns False
+        (and leaves the plot alone) if force is off and they are the ones already drawn."""
+        if self.store is None:
+            for line in (self.data_line, self.corr_line, self.err_bars):
+                line.set_data([], [])
+            return True
+        t, r, changed = self.view.get(self.store, self.stride(), whole)
+        if not (changed or force):
+            return False
+        squared, factor = self.squared.get(), self.factor()
+        for line, s, on in ((self.data_line, 1.0, self.show_raw.get()), (self.corr_line, factor, self.show_corr.get())):
+            if on:
+                line.set_data(t, (r * s) ** 2 if squared else r * s)
+            else:
+                line.set_data([], [])
+        if self.use_err.get():
+            step = max(1, len(t) // MAX_ERROR_BARS)
+            scale = self.fit_scale()
+            ts, rs = t[::step], r[::step] * scale
+            sigma = RADIUS_UNCERTAINTY_UM * scale
+            lower, upper = np.clip(rs - sigma, 0, None), rs + sigma
+            if squared:
+                lower, upper = lower ** 2, upper ** 2
+            x_bars = np.repeat(ts, 3)
+            y_bars = np.empty(3 * len(ts))
+            y_bars[0::3], y_bars[1::3], y_bars[2::3] = lower, upper, np.nan
+            x_bars[2::3] = np.nan
+            self.err_bars.set_data(x_bars, y_bars)
+        else:
+            self.err_bars.set_data([], [])
+        thinned = " (thinned to fit the screen: zoom in for every point)" if self.view.thinned else ""
+        self.axis.set_title(f"EDB evaporation — {self.store.count:,} retained; "
+                            f"{len(self.store) - self.store.count:,} culled; {len(t):,} drawn{thinned}", fontsize=10)
+        return True
+
+    def on_view(self):
+        """The x range has settled after a zoom or pan: draw the points of the new range."""
+        if self.store is not None and self.draw_points(force=False):
+            self.canvas.draw_idle()
 
     def update_plot(self, rescale=False):
         ax = self.axis
@@ -455,46 +518,11 @@ class CleanFitStage(ttk.Frame):
         show_err = self.use_err.get()
         if not (self.show_raw.get() or self.show_corr.get()):
             self.show_raw.set(True)
-        factor = self.factor()
-        scale = self.fit_scale()
+        self.factor()  # keeps the correction-factor label up to date
         ax.set_xlabel("Time since first point (s)")
         name = "Corrected radius" if self.show_corr.get() and not self.show_raw.get() else "Radius"
         ax.set_ylabel(f"{name}² (µm²)" if squared else f"{name} (µm)")
-        try:
-            stride = int(self.var["stride"].get())
-            if stride < 1:
-                raise ValueError
-        except ValueError:
-            stride = 1
-            self.status.set("Plot every Nth point must be a positive whole number; using 1.")
-        if self.store is not None:
-            t, r = self.store.active()
-            for line, s, on in ((self.data_line, 1.0, self.show_raw.get()),
-                                (self.corr_line, factor, self.show_corr.get())):
-                if on:
-                    y = (r * s) ** 2 if squared else r * s
-                    line.set_data(t[::stride], y[::stride])
-                else:
-                    line.set_data([], [])
-            if show_err:
-                step = max(1, len(t[::stride]) // MAX_ERROR_BARS) * stride
-                ts, rs = t[::step], r[::step] * scale
-                sigma = RADIUS_UNCERTAINTY_UM * scale
-                lower, upper = np.clip(rs - sigma, 0, None), rs + sigma
-                if squared:
-                    lower, upper = lower ** 2, upper ** 2
-                x_bars = np.repeat(ts, 3)
-                y_bars = np.empty(3 * len(ts))
-                y_bars[0::3], y_bars[1::3], y_bars[2::3] = lower, upper, np.nan
-                x_bars[2::3] = np.nan
-                self.err_bars.set_data(x_bars, y_bars)
-            else:
-                self.err_bars.set_data([], [])
-            ax.set_title(f"EDB evaporation — {len(t):,} retained; "
-                         f"{len(self.store.data) - len(t):,} culled; {len(t[::stride]):,} plotted")
-        else:
-            for line in (self.data_line, self.corr_line, self.err_bars):
-                line.set_data([], [])
+        self.draw_points(whole=rescale)
         if self.fit_band is not None:
             self.fit_band.remove()
             self.fit_band = None

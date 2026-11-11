@@ -1,5 +1,5 @@
-"""Main window. Stage 1 is built at start-up; stages 2 and 3 (and pandas, which only they use) are imported and
-built the first time they are opened or receive data."""
+"""Main window. Stage 1 is built at start-up; stages 2 and 3 are imported and built the first time they are opened or
+receive data. pandas is not needed to start: it is imported by the first file read or by stage 2, whichever is first."""
 import importlib
 import tkinter as tk
 from tkinter import messagebox, ttk

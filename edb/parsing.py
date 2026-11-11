@@ -17,6 +17,33 @@ def parse_number(text, label, optional=False):
     return value
 
 
+def parse_stride(text):
+    """The 'Plot every Nth point' box: None for automatic (blank or 'auto'), otherwise a positive whole number."""
+    text = text.strip().lower()
+    if text in ("", "auto"):
+        return None
+    stride = int(text)
+    if stride < 1:
+        raise ValueError("Plot every Nth point must be 'auto' or a positive whole number.")
+    return stride
+
+
+def parse_bin_width(text):
+    """The 'Bin width' box: None for automatic (blank or 'auto'), otherwise a number of seconds."""
+    if text.strip().lower() in ("", "auto"):
+        return None
+    return parse_number(text, "Bin width")
+
+
+def file_size(size):
+    """Bytes as a short label, e.g. 2.4 GB."""
+    for unit in ("B", "kB", "MB"):
+        if size < 1000:
+            return f"{size:.3g} {unit}"
+        size /= 1000
+    return f"{size:.3g} GB"
+
+
 def parse_limits(texts, labels=("X min", "X max", "Y min", "Y max"), positive_y=False):
     values = [parse_number(text, label, optional=True) for label, text in zip(labels, texts)]
     for i, name in ((0, "X"), (2, "Y")):
