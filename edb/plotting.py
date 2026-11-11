@@ -11,14 +11,18 @@ def apply_limits(ax, lo, hi, which):
     (ax.set_xlim if which == "x" else ax.set_ylim)(*new)
 
 
-def error_bars(ax, x, y, bounds, keep, color, show_x=True, show_y=True, zorder=3, alpha=1.0):
+def error_bars(ax, x, y, bounds, keep, color, show_x=True, show_y=True, zorder=3, alpha=1.0,
+               width=0.8, capsize=2.0, capthick=1.0, style="-"):
     """Asymmetric error bars from bounds = (x_lo, x_hi, y_lo, y_hi) for the points selected by keep."""
     if not (show_x or show_y):
         return
     x_lo, x_hi, y_lo, y_hi = (np.asarray(b, dtype=float)[keep] for b in bounds)
     x, y = np.asarray(x, dtype=float)[keep], np.asarray(y, dtype=float)[keep]
-    ax.errorbar(x, y, xerr=[x - x_lo, x_hi - x] if show_x else None, yerr=[y - y_lo, y_hi - y] if show_y else None,
-                fmt="none", ecolor=color, elinewidth=0.8, capsize=2, zorder=zorder, alpha=alpha)
+    bars = ax.errorbar(x, y, xerr=[x - x_lo, x_hi - x] if show_x else None,
+                       yerr=[y - y_lo, y_hi - y] if show_y else None, fmt="none", ecolor=color, elinewidth=width,
+                       capsize=capsize, capthick=capthick, zorder=zorder, alpha=alpha)
+    for lines in bars.lines[2]:
+        lines.set_linestyle(style)
 
 
 def _open_to_top(ax, values):
@@ -27,24 +31,30 @@ def _open_to_top(ax, values):
     return np.where(np.isposinf(values), ax.get_ylim()[1], values)
 
 
-def pvap_band(ax, x, unc, keep, color="grey", alpha=0.25, label="p_vap range"):
-    """Systematic p_vap range as a light band behind the points (sorted by MFS)."""
-    x = np.asarray(x, dtype=float)
-    keep = np.asarray(keep, dtype=bool) & np.isfinite(unc["lower"]) & ~np.isnan(unc["upper"])
+def band(ax, x, lower, upper, keep, color, alpha, label, zorder=1):
+    """Light band between lower and upper behind the points (sorted by x); an open upper bound reaches the top."""
+    x, lower, upper = (np.asarray(v, dtype=float) for v in (x, lower, upper))
+    keep = np.asarray(keep, dtype=bool) & np.isfinite(lower) & ~np.isnan(upper)
     if not keep.any():
         return
     order = np.argsort(x[keep], kind="stable")
-    lo, hi = unc["lower"][keep][order], _open_to_top(ax, unc["upper"][keep][order])
-    ax.fill_between(x[keep][order], lo, hi, color=color, alpha=alpha, linewidth=0, zorder=1, label=label)
+    lo, hi = lower[keep][order], _open_to_top(ax, upper[keep][order])
+    ax.fill_between(x[keep][order], lo, hi, color=color, alpha=alpha, linewidth=0, zorder=zorder, label=label)
 
 
-def combined_bars(ax, x, y, unc, keep, color, alpha=1.0):
+def pvap_band(ax, x, unc, keep, color="grey", alpha=0.25, label="p_vap range"):
+    """Systematic p_vap range as a light band behind the points (sorted by MFS)."""
+    band(ax, x, unc["lower"], unc["upper"], keep, color, alpha, label)
+
+
+def combined_bars(ax, x, y, unc, keep, color, alpha=1.0, **bar_style):
+    """bar_style: width, capsize, capthick, style as in error_bars."""
     keep = np.asarray(keep, dtype=bool) & np.isfinite(unc["combined_lower"]) & ~np.isnan(unc["combined_upper"])
     if keep.any():
         # an open bound on a point above the axes would end below the point: zero-length bar instead
         upper = np.maximum(_open_to_top(ax, unc["combined_upper"]), np.asarray(y, dtype=float))
         bounds = (x, x, unc["combined_lower"], upper)
-        error_bars(ax, x, y, bounds, keep, color, show_x=False, zorder=2.5, alpha=alpha)
+        error_bars(ax, x, y, bounds, keep, color, show_x=False, zorder=2.5, alpha=alpha, **bar_style)
 
 
 def pvap_values(unc, band, combined):
@@ -163,14 +173,22 @@ def auto_axis_limits(series, xscale, yscale, xerr=True, yerr=True, band=False, c
     return xlim, (values.min() - pad, values.max() + pad)
 
 
+def _bar_style(style, prefix):
+    """error_bars keywords from a publication series style, e.g. prefix "bar_" reads bar_width, bar_capsize..."""
+    return {key: style[prefix + key] for key in ("width", "capsize", "capthick", "style")}
+
+
 def draw_publication(ax, series, o):
     for name, style in o["series"].items():
-        for key in ("color", "bar_color", "band_color", "comb_color"):
+        for key in ("color", "bar_color", "band_color", "comb_color", "rband_color"):
             if not is_color_like(style[key]):
                 raise ValueError(f"'{style[key]}' is not a valid colour (use a name such as red, or a hex code like #1f77b4).")
-        for key in ("bar_alpha", "band_alpha", "comb_alpha"):
+        for key in ("bar_alpha", "band_alpha", "comb_alpha", "rband_alpha"):
             if not 0 <= style[key] <= 1:
                 raise ValueError(f"{name} alpha values must be between 0 and 1.")
+        for key in ("bar_capsize", "comb_capsize"):
+            if style[key] < 0:
+                raise ValueError(f"{name} cap sizes must not be negative.")
     for name, lo, hi, scale in (("X", o["xmin"], o["xmax"], o["xscale"]), ("Y", o["ymin"], o["ymax"], o["yscale"])):
         if lo is not None and hi is not None and lo >= hi:
             raise ValueError(f"{name} min must be below {name} max.")
@@ -192,9 +210,14 @@ def draw_publication(ax, series, o):
                 ax.plot(s["x"], s["y"], st["marker"], color=st["color"], markersize=st["size"], linestyle="none",
                         label=st["label"], zorder=3)
                 if s.get("bounds") is not None:
-                    keep = np.asarray(s["y"], dtype=float) > 0 if o["yscale"] == "log" else slice(None)
-                    error_bars(ax, s["x"], s["y"], s["bounds"], keep, st["bar_color"], o["xerr"], o["yerr"],
-                               alpha=st["bar_alpha"])
+                    y = np.asarray(s["y"], dtype=float)
+                    keep = y > 0 if o["yscale"] == "log" else np.ones(len(y), dtype=bool)
+                    as_band = o["yerr"] and st["yerr_mode"] == "band"
+                    error_bars(ax, s["x"], s["y"], s["bounds"], keep, st["bar_color"], o["xerr"],
+                               o["yerr"] and not as_band, alpha=st["bar_alpha"], **_bar_style(st, "bar_"))
+                    if as_band:
+                        band(ax, s["x"], s["bounds"][2], s["bounds"][3], keep, st["rband_color"],
+                             st["rband_alpha"], st["rband_label"], zorder=1.5)
     xlim, ylim = auto_axis_limits(series, o["xscale"], o["yscale"], o["xerr"], o["yerr"], o["band"], o["combined"])
     if xlim:
         ax.set_xlim(*xlim)
@@ -211,7 +234,7 @@ def draw_publication(ax, series, o):
         if o["band"]:
             pvap_band(ax, s["x"], s["pvap"], keep, st["band_color"], st["band_alpha"], st["band_label"])
         if o["combined"]:
-            combined_bars(ax, s["x"], y, s["pvap"], keep, st["comb_color"], st["comb_alpha"])
+            combined_bars(ax, s["x"], y, s["pvap"], keep, st["comb_color"], st["comb_alpha"], **_bar_style(st, "comb_"))
     ax.set_xlabel(o["xlabel"], fontsize=size)
     ax.set_ylabel(o["ylabel"], fontsize=size)
     if o["title"]:

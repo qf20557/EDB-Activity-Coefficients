@@ -29,14 +29,29 @@ class PlotStudio(tk.Toplevel):
         right = ttk.Frame(self)
         right.pack(side="left", fill="both", expand=True)
         row = [0]
+        self.sections = []  # (header label, text, expanded var)
+        self.rows = []  # (widgets, expanded var of their section, shown() or None)
 
-        def header(text):
-            ttk.Label(form, text=text, font=("TkDefaultFont", 10, "bold")).grid(
-                row=row[0], column=0, columnspan=2, sticky="w", pady=(8, 2))
+        def header(text, expanded=True):
+            open_ = tk.BooleanVar(value=expanded)
+            label = ttk.Label(form, font=("TkDefaultFont", 10, "bold"), cursor="hand2")
+            label.grid(row=row[0], column=0, columnspan=2, sticky="w", pady=(8, 2))
+            label.bind("<Button-1>", lambda _: (open_.set(not open_.get()), self.refresh()))
+            self.sections.append((label, text, open_))
             row[0] += 1
 
-        def entry(key, text, default, values=None, width=24):
-            ttk.Label(form, text=text).grid(row=row[0], column=0, sticky="w", pady=1)
+        def place(widgets, shown=None):
+            self.rows.append((widgets, self.sections[-1][2], shown))
+            row[0] += 1
+
+        def note(text, shown=None):
+            label = ttk.Label(form, text=text, font=("TkDefaultFont", 9, "italic"))
+            label.grid(row=row[0], column=0, columnspan=2, sticky="w", pady=(4, 0))
+            place((label,), shown)
+
+        def entry(key, text, default, values=None, width=24, shown=None):
+            label = ttk.Label(form, text=text)
+            label.grid(row=row[0], column=0, sticky="w", pady=1)
             var = tk.StringVar(value=str(default))
             widget = (ttk.Combobox(form, textvariable=var, values=values, width=width - 3) if values
                       else ttk.Entry(form, textvariable=var, width=width))
@@ -46,8 +61,14 @@ class PlotStudio(tk.Toplevel):
                     widget.bind(sequence, wheel)  # scroll the column, not the combobox value
             var.trace_add("write", lambda *_: self.schedule())
             self.v[key] = var
-            row[0] += 1
+            place((label, widget), shown)
 
+        def check(text, var, shown=None):
+            box = ttk.Checkbutton(form, text=text, variable=var, command=self.schedule)
+            box.grid(row=row[0], column=0, columnspan=2, sticky="w")
+            place((box,), shown)
+
+        has = lambda key: lambda: any(s.get(key) is not None for s in self.series)
         header("Text (use $...$ for maths, e.g. $\\gamma_{\\mathrm{A}}$)")
         entry("title", "Title", "")
         entry("xlabel", "X label", xlabel)
@@ -60,40 +81,55 @@ class PlotStudio(tk.Toplevel):
         entry("xmax", "X max", "")
         entry("ymin", "Y min", "")
         entry("ymax", "Y max", "")
-        for s in series:
-            header(f"{s['name']} ({'curve' if s['kind'] == 'line' else 'points'})")
-            entry(s["name"] + ".label", "Legend label", s["label"])
-            entry(s["name"] + ".color", "Colour (name or #hex)", s["color"], COLOURS)
-            if s["kind"] == "line":
-                entry(s["name"] + ".style", "Line style", s.get("style", "solid"), tuple(LINE_STYLES))
-                entry(s["name"] + ".width", "Line width", s.get("width", 1.2))
-            else:
-                entry(s["name"] + ".marker", "Marker", s.get("marker", "square"), tuple(MARKERS))
-                entry(s["name"] + ".size", "Marker size", s.get("size", 5))
-                entry(s["name"] + ".bar_color", "Radius bar colour (blank = marker)", "", COLOURS)
-                entry(s["name"] + ".bar_alpha", "Radius bar alpha (0-1)", 1.0)
-                entry(s["name"] + ".band_label", "p_vap band legend label", "p_vap range")
-                entry(s["name"] + ".band_color", "p_vap band colour", "grey", COLOURS)
-                entry(s["name"] + ".band_alpha", "p_vap band alpha (0-1)", 0.25)
-                entry(s["name"] + ".comb_color", "Combined bar colour", "red", COLOURS)
-                entry(s["name"] + ".comb_alpha", "Combined bar alpha (0-1)", 0.7)
-        header("Figure")
-        entry("width", "Width (in)", "6.5")
-        entry("height", "Height (in)", "5")
+        header("Plot elements")
         self.legend = tk.BooleanVar(value=True)
         self.grid_on = tk.BooleanVar(value=False)
         self.xerr = tk.BooleanVar(value=show_xerr)
         self.yerr = tk.BooleanVar(value=show_yerr)
         self.band = tk.BooleanVar(value=show_band)
         self.combined = tk.BooleanVar(value=show_combined)
-        for text, var in (("Show legend", self.legend), ("Show grid", self.grid_on),
-                          ("Show x error bars (radius uncertainty)", self.xerr),
-                          ("Show y error bars (radius uncertainty)", self.yerr),
-                          ("Show p_vap band (systematic)", self.band),
-                          ("Show combined y error bars (radius + p_vap)", self.combined)):
-            ttk.Checkbutton(form, text=text, variable=var, command=self.schedule).grid(
-                row=row[0], column=0, columnspan=2, sticky="w")
-            row[0] += 1
+        self.advanced = tk.BooleanVar(value=False)
+        check("Legend", self.legend)
+        check("Grid", self.grid_on)
+        check("x error (radius uncertainty)", self.xerr, has("bounds"))
+        check("y error (radius uncertainty)", self.yerr, has("bounds"))
+        check("p_vap band (systematic)", self.band, has("pvap"))
+        check("Combined y error bars (radius + p_vap)", self.combined, has("pvap"))
+        check("Advanced style options (line widths, caps)", self.advanced)
+        for s in series:
+            n = s["name"]
+            header(f"{n} ({'curve' if s['kind'] == 'line' else 'points'})")
+            entry(n + ".label", "Legend label", s["label"])
+            entry(n + ".color", "Colour (name or #hex)", s["color"], COLOURS)
+            if s["kind"] == "line":
+                entry(n + ".style", "Line style", s.get("style", "solid"), tuple(LINE_STYLES))
+                entry(n + ".width", "Line width", s.get("width", 1.2))
+                continue
+            entry(n + ".marker", "Marker", s.get("marker", "square"), tuple(MARKERS))
+            entry(n + ".size", "Marker size", s.get("size", 5))
+            shown = self.visibility(s)
+            entry(n + ".yerr_mode", "Radius y error as", "bars", ("bars", "band"), shown=shown["yerr"])
+            note("Radius band", shown["rband"])
+            entry(n + ".rband_label", "Legend label", "radius range", shown=shown["rband"])
+            entry(n + ".rband_color", "Colour", s["color"], COLOURS, shown=shown["rband"])
+            entry(n + ".rband_alpha", "Alpha (0-1)", 0.25, shown=shown["rband"])
+            for prefix, text, color, alpha in (("bar", "Radius error bars", s["color"], 1.0),
+                                               ("comb", "Combined error bars", "red", 0.7)):
+                basic, advanced = shown[prefix], shown[prefix + "_advanced"]
+                note(text, basic)
+                entry(f"{n}.{prefix}_color", "Colour", color, COLOURS, shown=basic)
+                entry(f"{n}.{prefix}_alpha", "Alpha (0-1)", alpha, shown=basic)
+                entry(f"{n}.{prefix}_width", "Line width", 0.8, shown=advanced)
+                entry(f"{n}.{prefix}_style", "Line style", "solid", tuple(LINE_STYLES), shown=advanced)
+                entry(f"{n}.{prefix}_capsize", "Cap size", 2, shown=advanced)
+                entry(f"{n}.{prefix}_capthick", "Cap thickness", 1.0, shown=advanced)
+            note("p_vap band", shown["band"])
+            entry(n + ".band_label", "Legend label", "p_vap range", shown=shown["band"])
+            entry(n + ".band_color", "Colour", "grey", COLOURS, shown=shown["band"])
+            entry(n + ".band_alpha", "Alpha (0-1)", 0.25, shown=shown["band"])
+        header("Figure size", expanded=False)
+        entry("width", "Width (in)", "6.5")
+        entry("height", "Height (in)", "5")
         ttk.Button(form, text=f"Save figure ({SAVE_DPI} dpi)...", command=self.save).grid(
             row=row[0], column=0, columnspan=2, sticky="ew", pady=(10, 2))
         self.status = tk.StringVar(value="Edits update the preview as you type.")
@@ -106,7 +142,31 @@ class PlotStudio(tk.Toplevel):
         holder.pack(expand=True)
         self.canvas = FigureCanvasTkAgg(self.fig, master=holder)
         self.canvas.get_tk_widget().pack()
+        self.refresh()
         self.update_plot()
+
+    def visibility(self, s):
+        """shown() predicates for the uncertainty settings of points series s: only what is currently drawn."""
+        n = s["name"]
+        bounds = lambda: s.get("bounds") is not None
+        pvap = lambda: s.get("pvap") is not None
+        y_band = lambda: self.v[n + ".yerr_mode"].get().strip() == "band"
+        bars = lambda: bounds() and (self.xerr.get() or (self.yerr.get() and not y_band()))
+        comb = lambda: pvap() and self.combined.get()
+        return dict(yerr=lambda: bounds() and self.yerr.get(),
+                    rband=lambda: bounds() and self.yerr.get() and y_band(),
+                    bar=bars, bar_advanced=lambda: bars() and self.advanced.get(),
+                    comb=comb, comb_advanced=lambda: comb() and self.advanced.get(),
+                    band=lambda: pvap() and self.band.get())
+
+    def refresh(self):
+        """Show only the settings that apply now; collapsed sections hide their rows."""
+        for label, text, open_ in self.sections:
+            label.configure(text=f"{'▾' if open_.get() else '▸'} {text}")
+        for widgets, open_, shown in self.rows:
+            visible = open_.get() and (shown is None or shown())
+            for widget in widgets:
+                widget.grid() if visible else widget.grid_remove()
 
     def set_data(self, data):
         """data: {series name: (x, y), (x, y, bounds), (x, y, bounds, pvap) or None}; pvap is pvap_bounds output.
@@ -119,6 +179,7 @@ class PlotStudio(tk.Toplevel):
         self.schedule()
 
     def schedule(self):
+        self.refresh()
         if self.pending is not None:
             self.after_cancel(self.pending)
         self.pending = self.after(40, self.update_plot)
@@ -139,11 +200,25 @@ class PlotStudio(tk.Toplevel):
             color = get(n + ".color").strip()
             text = lambda key, default: get(n + key).strip() if n + key in self.v else default
             alpha = lambda key, default: self.number(n + key, f"{n} alpha") if n + key in self.v else default
+            bars = {}
+            for prefix, text_label in (("bar", "radius bar"), ("comb", "combined bar")):
+                number = lambda key, label, default, positive=True: (
+                    self.number(f"{n}.{prefix}_{key}", f"{n} {text_label} {label}", positive=positive)
+                    if f"{n}.{prefix}_{key}" in self.v else default)
+                bar_style = text(f".{prefix}_style", "solid")
+                bars.update({
+                    f"{prefix}_width": number("width", "line width", 0.8),
+                    f"{prefix}_capsize": number("capsize", "cap size", 2.0, positive=False),
+                    f"{prefix}_capthick": number("capthick", "cap thickness", 1.0),
+                    f"{prefix}_style": LINE_STYLES.get(bar_style, bar_style if bar_style in LINE_STYLES.values() else "-")})
             styles[n] = dict(
                 bar_color=text(".bar_color", "") or color, bar_alpha=alpha(".bar_alpha", 1.0),
                 band_label=text(".band_label", "p_vap range"), band_color=text(".band_color", "grey"),
-                band_alpha=alpha(".band_alpha", 0.25), comb_color=text(".comb_color", "red"),
-                comb_alpha=alpha(".comb_alpha", 0.7),
+                band_alpha=alpha(".band_alpha", 0.25), comb_color=text(".comb_color", "") or "red",
+                comb_alpha=alpha(".comb_alpha", 0.7), **bars,
+                yerr_mode="band" if text(".yerr_mode", "bars") == "band" else "bars",
+                rband_label=text(".rband_label", "radius range"), rband_color=text(".rband_color", "") or color,
+                rband_alpha=alpha(".rband_alpha", 0.25),
                 label=get(n + ".label"), color=color,
                 marker=MARKERS.get(marker, marker if marker in MARKERS.values() else "s"),
                 size=self.number(n + ".size", n + " marker size", positive=True) if n + ".size" in self.v else 5.0,

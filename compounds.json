@@ -38,5 +38,10 @@
     "density_g_ml": 1.424,
     "molar_mass_g_mol": 132.115,
     "refractive_index": 1.41878
+  },
+  "2-methylsuccinic acid" : {
+    "density_g_ml": 1.4105,
+    "molar_mass_g_mol": 132.11,
+    "refractive_index": 1.474
   }
 }

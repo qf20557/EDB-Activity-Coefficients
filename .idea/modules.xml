@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/EDB-Activity-Coefficients.iml" filepath="$PROJECT_DIR$/.idea/EDB-Activity-Coefficients.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/edb-activity-coefficients.iml" filepath="$PROJECT_DIR$/.idea/edb-activity-coefficients.iml" />
     </modules>
   </component>
 </project>
