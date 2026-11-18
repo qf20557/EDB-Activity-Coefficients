@@ -1,24 +1,26 @@
-"""Stage 1 UI: Clean & fit (EDB Plotter)."""
+"""Stage 1 Streamlit UI: Clean & fit."""
 import csv
-import time
-import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+import time
 
 import numpy as np
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.figure import Figure
-from matplotlib.widgets import RectangleSelector, SpanSelector
+import streamlit as st
 
-from ..config import EDB_ASSUMED_RI, MAX_ERROR_BARS, RADIUS_UNCERTAINTY_UM
+from ..config import EDB_ASSUMED_RI, RADIUS_UNCERTAINTY_UM
 from ..culling import PointStore
 from ..fitting import export_points, fit_curve, fit_trace
 from ..optics import correction_factor
-from ..parsing import file_size, parse_limits, parse_number, parse_stride
-from ..plotting import apply_limits
+from ..parsing import file_size, parse_limits, parse_number
+from ..raster import build_stage1_figure
 from ..raw_data import read_files, write_cleaned
-from .widgets import PointView, Progress, nav_bar, scrollable
+from .widgets import ask_open_files, ask_save_file, extract_selection_box
 
+MODE_LABELS = {
+    "fit": "Fit region",
+    "zoom": "Zoom",
+    "cull": "Cull",
+    "keep": "Keep box",
+}
 
 MODE_HELP = {
     "fit": "Fit region: drag horizontally to fit that time region.",
@@ -28,524 +30,624 @@ MODE_HELP = {
 }
 
 
-class CleanFitStage(ttk.Frame):
-    def __init__(self, master, app):
-        super().__init__(master)
-        self.app = app
-        self.files = []
-        self.store = None
-        self.fit = None
-        self.fit_band = None
-        self.var = {name: tk.StringVar(value=value) for name, value in (
-            ("stride", "auto"), ("fit_lo", ""), ("fit_hi", ""),
-            ("x_min", ""), ("x_max", ""), ("y_min", ""), ("y_max", ""))}
-        self.squared = tk.BooleanVar(value=False)
-        self.use_err = tk.BooleanVar(value=False)
-        self.compound = tk.StringVar(value="")
-        self.n_true = tk.StringVar(value="")
-        self.rho_true = tk.StringVar(value="")
-        self.show_raw = tk.BooleanVar(value=True)
-        self.show_corr = tk.BooleanVar(value=False)
-        self.mode = tk.StringVar(value="fit")
-        self.status = tk.StringVar(value="Add raw EDB files or cleaned data (in acquisition order), then click "
-                                         "Load / plot. Files of several GB are fine: they load in the background.")
-        self.fit_text = tk.StringVar(value="Fit: none yet.")
-        self.build()
+def init_stage1_state():
+    defaults = {
+        "s1_files": [],  # ordered list of file path strings
+        "s1_selected": set(),  # set of selected file path strings in the list
+        "s1_last_dir": None,
+        "s1_store": None,
+        "s1_fit": None,
+        "s1_squared": False,
+        "s1_use_err": False,
+        "s1_compound": "",
+        "s1_allow_no_ri": False,
+        "s1_show_raw": True,
+        "s1_show_corr": False,
+        "s1_mode": "fit",
+        "s1_fit_lo": "",
+        "s1_fit_hi": "",
+        "s1_xmin": "",
+        "s1_xmax": "",
+        "s1_ymin": "",
+        "s1_ymax": "",
+        "s1_nonce": 0,
+        "s1_status": (
+            "Add raw EDB files or cleaned data (in acquisition order), then click Load / plot. "
+            "Files of several GB are supported and all points are plotted."
+        ),
+        "s1_fit_text": "Fit: none yet.",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    def build(self):
-        nav_bar(self, next_=self.app.to_stage2, next_text="Next: MFS & gradients →")
-        outer, content = scrollable(self)
-        outer.pack(fill="both", expand=True)
 
-        top = ttk.Frame(content, padding=6)
-        top.pack(fill="x")
+def _factor_for(compounds, name):
+    info = compounds.get(name, {})
+    n = info.get("refractive_index")
+    if n is not None and n > 0:
+        return correction_factor(float(n))
+    return 1.0
 
-        files = ttk.LabelFrame(top, text="Files (acquisition order)", padding=6)
-        files.pack(side="left", fill="y")
-        self.listbox = tk.Listbox(files, height=5, width=32, selectmode=tk.EXTENDED)
-        self.listbox.pack(side="left")
-        buttons = ttk.Frame(files)
-        buttons.pack(side="left", padx=6)
-        for text, command in (("Add files...", self.add_files), ("Remove selected", self.remove_files),
-                              ("Move up", lambda: self.move(-1)), ("Move down", lambda: self.move(1)),
-                              ("Clear", self.clear_files)):
-            ttk.Button(buttons, text=text, command=command).pack(fill="x", pady=1)
 
-        opts = ttk.LabelFrame(top, text="Plot and fit", padding=6)
-        opts.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        ttk.Checkbutton(opts, text="Plot radius² (otherwise radius)", variable=self.squared,
-                        command=lambda: self.update_plot(rescale=True)).grid(row=0, column=0, columnspan=4, sticky="w")
-        ttk.Checkbutton(opts, text="100nm uncertainty (error bars, fit band, CSV error columns)",
-                        variable=self.use_err, command=self.update_plot).grid(
-            row=1, column=0, columnspan=4, sticky="w")
-        ttk.Label(opts, text="Plot every Nth point").grid(row=2, column=0, sticky="w")
-        entry = ttk.Entry(opts, textvariable=self.var["stride"], width=7)
-        entry.grid(row=2, column=1, sticky="w")
-        entry.bind("<Return>", lambda _: self.update_plot())
-        ttk.Label(opts, text="(auto = thinned to fit the screen, spikes kept; zoom in for every point)").grid(
-            row=2, column=2, columnspan=2, sticky="w", padx=(4, 0))
-        ttk.Label(opts, text="Fit from (s)").grid(row=3, column=0, sticky="w")
-        ttk.Entry(opts, textvariable=self.var["fit_lo"], width=10).grid(row=3, column=1, sticky="w")
-        ttk.Label(opts, text="to (s)").grid(row=3, column=2, sticky="e")
-        ttk.Entry(opts, textvariable=self.var["fit_hi"], width=10).grid(row=3, column=3, sticky="w")
-        ttk.Label(opts, text="(blank = whole trace; or drag in Fit region mode)").grid(
-            row=4, column=0, columnspan=4, sticky="w")
+def _fit_scale(compounds):
+    if st.session_state["s1_show_corr"]:
+        return _factor_for(compounds, st.session_state["s1_compound"])
+    return 1.0
 
-        corr = ttk.LabelFrame(top, text="Radius correction (compounds.json)", padding=6)
-        corr.pack(side="left", fill="y", padx=(8, 0))
-        ttk.Label(corr, text="Compound").grid(row=0, column=0, sticky="w")
-        combo = ttk.Combobox(corr, textvariable=self.compound, values=sorted(self.app.compounds),
-                             state="readonly", width=18)
-        combo.grid(row=0, column=1, sticky="w")
-        combo.bind("<<ComboboxSelected>>", lambda _: self.on_compound())
-        ttk.Label(corr, text="Refractive index").grid(row=1, column=0, sticky="w")
-        ttk.Entry(corr, textvariable=self.n_true, width=10, state="readonly").grid(row=1, column=1, sticky="w")
-        ttk.Label(corr, text="Density (g/mL)").grid(row=2, column=0, sticky="w")
-        ttk.Entry(corr, textvariable=self.rho_true, width=10, state="readonly").grid(row=2, column=1, sticky="w")
-        ttk.Checkbutton(corr, text="Plot raw radius", variable=self.show_raw,
-                        command=self.on_basis_change).grid(row=3, column=0, sticky="w")
-        ttk.Checkbutton(corr, text="Plot corrected radius", variable=self.show_corr,
-                        command=self.on_basis_change).grid(row=3, column=1, sticky="w")
-        self.factor_text = tk.StringVar(value=f"EDB assumed RI {EDB_ASSUMED_RI}; factor 1.0000")
-        ttk.Label(corr, textvariable=self.factor_text).grid(row=4, column=0, columnspan=2, sticky="w")
-        ttk.Label(corr, text="The displayed fit follows the plotted radius;\nstage 2 and exported fits always use\n"
-                             "the corrected radius.",
-                  foreground="#555").grid(row=5, column=0, columnspan=2, sticky="w")
 
-        act = ttk.Frame(content, padding=(6, 0))
-        act.pack(fill="x")
-        self.file_buttons = []  # disabled while a file is being read or written
-        for text, command in (("Load / plot", self.load), ("Fit", self.do_fit),
-                              ("Clear fit region", self.clear_region), ("Save cleaned data", self.save_altered),
-                              ("Export fit CSV", self.export_fit)):
-            button = ttk.Button(act, text=text, command=command)
-            button.pack(side="left", padx=2, pady=3)
-            if command in (self.load, self.save_altered):
-                self.file_buttons.append(button)
-        self.progress = Progress(act)
+def _cull_scale(compounds):
+    if st.session_state["s1_show_corr"] and not st.session_state["s1_show_raw"]:
+        return _factor_for(compounds, st.session_state["s1_compound"])
+    return 1.0
 
-        modes = ttk.LabelFrame(content, text="Plot mode (drag on the plot)", padding=4)
-        modes.pack(fill="x", padx=6, pady=2)
-        for text, value in (("Fit region", "fit"), ("Zoom", "zoom"), ("Cull", "cull"), ("Keep box", "keep")):
-            ttk.Radiobutton(modes, text=text, value=value, variable=self.mode,
-                            command=self.set_mode).pack(side="left", padx=6)
-        for text, command in (("Undo cull", self.undo_cull), ("Restore all", self.restore_points),
-                              ("Reset zoom", self.reset_zoom)):
-            ttk.Button(modes, text=text, command=command).pack(side="left", padx=3)
-        axes = ttk.Frame(modes)
-        axes.pack(side="right")
-        for label, key in (("X min", "x_min"), ("X max", "x_max"), ("Y min", "y_min"), ("Y max", "y_max")):
-            ttk.Label(axes, text=label).pack(side="left", padx=(0, 2))
-            box = ttk.Entry(axes, textvariable=self.var[key], width=7)
-            box.pack(side="left", padx=(0, 6))
-            box.bind("<Return>", lambda _: self.update_plot())
-        ttk.Button(axes, text="Apply axes", command=self.update_plot).pack(side="left")
 
-        ttk.Label(content, textvariable=self.status, wraplength=1150).pack(anchor="w", padx=8)
-        ttk.Label(content, textvariable=self.fit_text, wraplength=1150, justify="left").pack(anchor="w", padx=8)
+def _run_fit(compounds):
+    store = st.session_state["s1_store"]
+    if store is None:
+        st.session_state["s1_fit_text"] = "Load data first."
+        return
+    try:
+        lo = parse_number(st.session_state["s1_fit_lo"], "Fit from", optional=True)
+        hi = parse_number(st.session_state["s1_fit_hi"], "Fit to", optional=True)
+        scale = _fit_scale(compounds)
+        fit = fit_trace(store, lo, hi, scale)
+        fit["scale"] = scale
+        st.session_state["s1_fit"] = fit
+        basis = "corrected radius" if scale != 1.0 else "radius"
+        st.session_state["s1_fit_text"] = (
+            f"{fit['label']} to {basis}, {fit['lo']:.6g}-{fit['hi']:.6g} s, {fit['n']:,} retained points. "
+            f"RMS residual {fit['rms']:.4g} µm, R² {fit['r2']:.6f}. {fit['detail']}"
+        )
+    except ValueError as err:
+        st.session_state["s1_fit"] = None
+        st.session_state["s1_fit_text"] = f"Fit failed: {err}"
 
-        self.figure = Figure(figsize=(8, 4.6))
-        self.axis = self.figure.add_subplot(111)
-        self.axis.grid(alpha=0.3)
-        self.data_line, = self.axis.plot([], [], linestyle="none", marker="x", markersize=4,
-                                         markeredgewidth=0.8, color="tab:blue", label="Raw")
-        self.corr_line, = self.axis.plot([], [], linestyle="none", marker="x", markersize=4,
-                                         markeredgewidth=0.8, color="tab:green", label="Corrected")
-        self.err_bars, = self.axis.plot([], [], color="tab:blue", linewidth=0.6, alpha=0.6, zorder=1)
-        self.fit_line, = self.axis.plot([], [], color="tab:red", linewidth=1.8, label="Monotone convex fit")
-        plot = ttk.Frame(content)
-        plot.pack(fill="both", expand=True)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=plot)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, plot, pack_toolbar=False)
-        self.toolbar.pack(side="bottom", fill="x")
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-        self.span = SpanSelector(self.axis, self.on_span, "horizontal", useblit=True, interactive=False,
-                                 props={"alpha": 0.2, "facecolor": "crimson"})
-        self.rect = RectangleSelector(self.axis, self.on_box, useblit=True, button=[1], minspanx=3, minspany=3,
-                                      spancoords="pixels", interactive=False,
-                                      props=dict(facecolor="orange", edgecolor="darkorange", alpha=0.25))
-        self.rect.set_active(False)
-        self.view = PointView(self, self.axis, self.on_view)
-        self.update_plot(rescale=True)
 
-    # file list
-    def refresh_list(self):
-        self.listbox.delete(0, tk.END)
-        for i, path in enumerate(self.files, 1):
-            try:
-                size = f"  ({file_size(Path(path).stat().st_size)})"
-            except OSError:
-                size = ""
-            self.listbox.insert(tk.END, f"{i:02d}. {Path(path).name}{size}")
+def _on_basis_or_compound_change(compounds):
+    if not (st.session_state["s1_show_raw"] or st.session_state["s1_show_corr"]):
+        st.session_state["s1_show_raw"] = True
+    name = st.session_state["s1_compound"]
+    if name and compounds.get(name, {}).get("refractive_index") is None:
+        st.session_state["s1_status"] = f"No refractive_index for {name} in compounds.json; factor = 1."
+    if st.session_state["s1_store"] is not None and st.session_state["s1_fit"] is not None:
+        _run_fit(compounds)
+    st.session_state["s1_ymin"] = ""
+    st.session_state["s1_ymax"] = ""
 
-    def add_files(self):
-        for path in filedialog.askopenfilenames(title="Select EDB files or cleaned data", filetypes=[
-                ("Data files", "*.txt *.dat *.csv *.npz"), ("All files", "*")]):
-            if path not in self.files:
-                self.files.append(path)
-        self.refresh_list()
-        if self.files:
-            self.status.set(f"{len(self.files)} file(s) listed. Put them in acquisition order, then click "
-                            "Load / plot.")
 
-    def remove_files(self):
-        for i in reversed(self.listbox.curselection()):
-            del self.files[i]
-        self.refresh_list()
+def _on_squared_change():
+    st.session_state["s1_ymin"] = ""
+    st.session_state["s1_ymax"] = ""
 
-    def clear_files(self):
-        self.files.clear()
-        self.refresh_list()
 
-    def move(self, direction):
-        chosen = self.listbox.curselection()
-        if len(chosen) != 1:
-            return
-        i, j = chosen[0], chosen[0] + direction
-        if 0 <= j < len(self.files):
-            self.files[i], self.files[j] = self.files[j], self.files[i]
-            self.refresh_list()
-            self.listbox.selection_set(j)
+def _on_clear_region(compounds):
+    st.session_state["s1_fit_lo"] = ""
+    st.session_state["s1_fit_hi"] = ""
+    _run_fit(compounds)
 
-    def load(self):
-        """Read the listed files on a background thread; the previous data stays on screen until it is done."""
-        files, started = list(self.files), time.perf_counter()
 
-        def work(progress, cancel):
-            t, r, skipped = read_files(files, progress, cancel)
-            return PointStore(t, r), skipped
+def _after_edit(compounds):
+    store = st.session_state["s1_store"]
+    total, kept = len(store), store.count
+    st.session_state["s1_status"] = (
+        f"{kept:,} retained / {total:,} loaded points; {total - kept:,} culled. Source files unchanged."
+    )
+    if st.session_state["s1_fit"] is not None:
+        _run_fit(compounds)
 
-        def done(result):
-            self.store, skipped = result
-            self.fit = None
-            self.status.set(f"Loaded {len(self.store):,} points from {len(files)} file(s) in "
-                            f"{time.perf_counter() - started:.1f} s; skipped {skipped:,} non-data lines. Radius "
-                            "assumed in µm; time starts at 0 s.")
-            self.fit_text.set("Fit: none yet. Drag in Fit region mode or click Fit for the whole trace.")
-            self.update_plot(rescale=True)
 
-        self.progress.run("Loading", work, done,
-                          lambda error: messagebox.showerror("Load error", str(error) or repr(error), parent=self),
-                          lambda: self.status.set("Load cancelled; the previous data (if any) is unchanged."),
-                          lock=self.file_buttons)
+def _on_undo(compounds):
+    store = st.session_state["s1_store"]
+    if store is not None and store.undo():
+        _after_edit(compounds)
 
-    # modes and correction
-    def set_mode(self):
-        mode = self.mode.get()
-        text = str(self.toolbar.mode).lower()
-        if "zoom" in text:
-            self.toolbar.zoom()
-        elif "pan" in text:
-            self.toolbar.pan()
-        self.span.set_active(mode == "fit")
-        self.rect.set_active(mode != "fit")
-        self.status.set(MODE_HELP[mode])
 
-    def on_compound(self):
-        info = self.app.compounds.get(self.compound.get(), {})
-        n, rho = info.get("refractive_index"), info.get("density_g_ml")
-        self.n_true.set("" if n is None else f"{n:g}")
-        self.rho_true.set("" if rho is None else f"{rho:g}")
-        if n is None:
-            self.status.set(f"No refractive_index for {self.compound.get()} in compounds.json; factor = 1.")
-        self.on_basis_change()
+def _on_restore(compounds):
+    store = st.session_state["s1_store"]
+    if store is not None:
+        store.restore()
+        _after_edit(compounds)
 
-    def on_basis_change(self):
-        """The radius basis (raw or corrected) changed: refit so the fit always matches what is shown."""
-        if self.store is not None and self.fit is not None:
-            self.do_fit(redraw=False)
-        self.update_plot(rescale=True)
 
-    def factor(self):
+def _on_reset_zoom():
+    st.session_state["s1_xmin"] = ""
+    st.session_state["s1_xmax"] = ""
+    st.session_state["s1_ymin"] = ""
+    st.session_state["s1_ymax"] = ""
+    st.session_state["s1_nonce"] += 1
+
+
+def _on_mode_change():
+    st.session_state["s1_status"] = MODE_HELP[st.session_state["s1_mode"]]
+
+
+def _on_plot_select(compounds):
+    box = extract_selection_box(st.session_state.get("s1_plot"))
+    st.session_state["s1_nonce"] += 1
+    store = st.session_state["s1_store"]
+    if box is None or store is None:
+        return
+    xmin, xmax, ymin, ymax = box
+    mode = st.session_state["s1_mode"]
+    if mode == "fit":
+        if xmax > xmin:
+            st.session_state["s1_fit_lo"] = f"{xmin:.8g}"
+            st.session_state["s1_fit_hi"] = f"{xmax:.8g}"
+            _run_fit(compounds)
+    elif mode == "zoom":
+        if xmax > xmin and ymax > ymin:
+            st.session_state["s1_xmin"] = f"{xmin:.8g}"
+            st.session_state["s1_xmax"] = f"{xmax:.8g}"
+            st.session_state["s1_ymin"] = f"{ymin:.8g}"
+            st.session_state["s1_ymax"] = f"{ymax:.8g}"
+    elif mode in ("cull", "keep"):
         try:
-            n = float(self.n_true.get())
-            f = correction_factor(n) if n > 0 else 1.0
-        except ValueError:
-            f = 1.0
-        self.factor_text.set(f"EDB assumed RI {EDB_ASSUMED_RI}; factor {f:.4f}")
-        return f
+            removed = store.cull_box(
+                (xmin, xmax, ymin, ymax),
+                st.session_state["s1_squared"],
+                keep_inside=(mode == "keep"),
+                scale=_cull_scale(compounds),
+            )
+        except ValueError as err:
+            st.session_state["s1_status"] = f"Cull: {err}"
+            return
+        if removed:
+            _after_edit(compounds)
 
-    def fit_scale(self):
-        return self.factor() if self.show_corr.get() else 1.0
 
-    def require_correction(self, action):
-        """Correction factor for outputs that must be on the corrected radius, or None if the user backs out."""
-        name = self.compound.get()
-        if name not in self.app.compounds:
-            messagebox.showinfo("No compound", f"Choose the droplet compound (radius correction) before {action}: "
-                                "stage 2 and the exported files always use the corrected radius.", parent=self)
-            return None
-        if self.app.compounds[name].get("refractive_index") is None and not messagebox.askyesno(
-                "No refractive index", f"{name} has no refractive_index in compounds.json, so the corrected "
-                "radius equals the raw radius (factor 1). Continue?", parent=self):
-            return None
-        return self.factor()
+def _check_correction(compounds, action):
+    name = st.session_state["s1_compound"]
+    if name not in compounds:
+        return None, (
+            f"Choose the droplet compound (Radius correction) before {action}: "
+            "stage 2 and the exported files always use the corrected radius."
+        )
+    if compounds[name].get("refractive_index") is None and not st.session_state["s1_allow_no_ri"]:
+        return None, (
+            f"'{name}' has no refractive_index in compounds.json (factor = 1.0). "
+            "Tick 'Confirm factor = 1.0' under Radius correction to continue."
+        )
+    return _factor_for(compounds, name), None
 
-    def corrected_fit(self):
-        """The current fit on the corrected radius: the displayed fit if it already is, otherwise a refit of the
-        same retained points over the same time window."""
-        factor = self.factor()
-        if self.fit["scale"] == factor:
-            return self.fit
-        fit = fit_trace(self.store, self.fit["lo"], self.fit["hi"], factor)
-        fit["scale"] = factor
+
+def _corrected_fit(compounds):
+    fit = st.session_state["s1_fit"]
+    factor = _factor_for(compounds, st.session_state["s1_compound"])
+    if fit["scale"] == factor:
         return fit
+    refit = fit_trace(st.session_state["s1_store"], fit["lo"], fit["hi"], factor)
+    refit["scale"] = factor
+    return refit
 
-    # plot interaction
-    def on_span(self, lo, hi):
-        if self.store is None or lo == hi:
-            return
-        lo, hi = sorted((lo, hi))
-        self.var["fit_lo"].set(f"{lo:.8g}")
-        self.var["fit_hi"].set(f"{hi:.8g}")
-        self.do_fit()
 
-    def on_box(self, press, release):
-        if self.store is None or None in (press.xdata, press.ydata, release.xdata, release.ydata):
-            return
-        xmin, xmax = sorted((press.xdata, release.xdata))
-        ymin, ymax = sorted((press.ydata, release.ydata))
-        mode = self.mode.get()
-        if mode == "zoom":
-            self.axis.set_xlim(xmin, xmax)
-            self.axis.set_ylim(ymin, ymax)
-        elif mode in ("cull", "keep"):
-            try:
-                removed = self.store.cull_box((xmin, xmax, ymin, ymax), self.squared.get(), mode == "keep",
-                                              self.cull_scale())
-            except ValueError as error:
-                messagebox.showinfo("Cull", str(error), parent=self)
-                removed = 0
-            if removed:
-                self.after_edit()
-        self.rect.clear()
-        self.canvas.draw_idle()
+def _write_fit_csv(path, fit, use_err):
+    x, radius, radius2 = fit_curve(fit, export_points(fit))
+    header = [
+        "time_s",
+        "fitted_radius_corrected_um",
+        "fitted_radius_corrected_squared_um2",
+        "radius_correction_factor",
+    ]
+    columns = [x, radius, radius2, np.full_like(x, fit["scale"])]
+    if use_err:
+        sigma = RADIUS_UNCERTAINTY_UM * fit["scale"]
+        header += [
+            "fitted_radius_corrected_err_um",
+            "fitted_radius_corrected_lower_um",
+            "fitted_radius_corrected_upper_um",
+            "fitted_radius_corrected_squared_err_um2",
+            "fitted_radius_corrected_squared_lower_um2",
+            "fitted_radius_corrected_squared_upper_um2",
+        ]
+        columns += [
+            np.full_like(radius, sigma),
+            radius - sigma,
+            radius + sigma,
+            2 * radius * sigma,
+            (radius - sigma) ** 2,
+            (radius + sigma) ** 2,
+        ]
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        writer.writerows(zip(*columns))
 
-    def cull_scale(self):
-        # boxes are drawn on whichever series is visible; when both are shown the raw series sets the scale
-        return self.factor() if self.show_corr.get() and not self.show_raw.get() else 1.0
 
-    def after_edit(self):
-        total, kept = len(self.store), self.store.count
-        self.status.set(f"{kept:,} retained / {total:,} loaded points; {total - kept:,} culled. "
-                        "Source files unchanged.")
-        if self.fit is not None:
-            self.do_fit(redraw=False)
-        self.update_plot()
+def stage1_handoff(compounds):
+    store = st.session_state["s1_store"]
+    fit = st.session_state["s1_fit"]
+    if store is None:
+        return None, "Load EDB data first."
+    if fit is None:
+        return None, "Fit the data before moving on (click Fit or drag a fit region)."
+    factor, err = _check_correction(compounds, "moving on")
+    if err:
+        return None, err
+    try:
+        c_fit = _corrected_fit(compounds)
+    except ValueError as exc:
+        return None, f"Could not fit the corrected radius: {exc}"
+    x, _, radius2 = fit_curve(c_fit, export_points(c_fit))
+    return dict(
+        edb=store.snapshot(),
+        fit_t=x,
+        fit_r2=radius2,
+        factor=factor,
+        sigma=RADIUS_UNCERTAINTY_UM * factor,
+        refitted=c_fit is not fit,
+    ), None
 
-    def undo_cull(self):
-        if self.store is not None and self.store.undo():
-            self.after_edit()
 
-    def restore_points(self):
-        if self.store is not None:
-            self.store.restore()
-            self.after_edit()
+def _toggle_file_select(path, key):
+    if st.session_state.get(key):
+        st.session_state["s1_selected"].add(path)
+    else:
+        st.session_state["s1_selected"].discard(path)
 
-    def reset_zoom(self):
-        self.update_plot(rescale=True)
 
-    # outputs
-    def save_altered(self):
-        if self.store is None:
-            messagebox.showinfo("No data", "Load data first.", parent=self)
-            return
-        factor = self.require_correction("saving")
-        if factor is None:
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv", initialfile="Cleaned EDB Data", parent=self,
-            filetypes=[("CSV", "*.csv"), ("NumPy binary: saves and reloads large data in seconds", "*.npz")])
-        if not path:
-            return
-        if any(Path(path).exists() and Path(path).samefile(p) for p in self.files):
-            messagebox.showerror("Input selected", "Choose an output file different from the inputs.", parent=self)
-            return
-        trace = self.store.snapshot()  # points culled while the file is being written do not change it
-        sigma = RADIUS_UNCERTAINTY_UM * factor if self.use_err.get() else None
+def _add_files_click():
+    chosen = ask_open_files(
+        title="Select EDB files or cleaned data",
+        filetypes=[
+            ("Data files (*.txt;*.dat;*.csv;*.npz)", "*.txt;*.dat;*.csv;*.npz"),
+            ("All files (*.*)", "*.*"),
+        ],
+        multiple=True,
+        initial_dir=st.session_state["s1_last_dir"],
+    )
+    if chosen:
+        st.session_state["s1_last_dir"] = str(Path(chosen[0]).parent)
+        files = st.session_state["s1_files"]
+        for p in chosen:
+            if p not in files:
+                files.append(p)
+        st.session_state["s1_status"] = (
+            f"{len(files)} file(s) listed. Put them in acquisition order, then click Load / plot."
+        )
+
+
+def _remove_selected_click():
+    selected = st.session_state["s1_selected"]
+    st.session_state["s1_files"] = [p for p in st.session_state["s1_files"] if p not in selected]
+    selected.clear()
+
+
+def _clear_files_click():
+    st.session_state["s1_files"].clear()
+    st.session_state["s1_selected"].clear()
+
+
+def _move_file_click(direction):
+    files = st.session_state["s1_files"]
+    selected = [i for i, p in enumerate(files) if p in st.session_state["s1_selected"]]
+    if len(selected) != 1:
+        return
+    i = selected[0]
+    j = i + direction
+    if 0 <= j < len(files):
+        files[i], files[j] = files[j], files[i]
+
+
+def render_clean_fit_stage(compounds, on_next_stage):
+    init_stage1_state()
+
+    # Top row: 3 side-by-side panels matching the original desktop layout
+    col_files, col_opts, col_corr = st.columns([1.25, 1.1, 1.05], gap="medium")
+
+    with col_files:
+        with st.container(border=True):
+            st.markdown("##### Files (acquisition order)")
+            list_col, btn_col = st.columns([1.85, 1.0], gap="small")
+            files = st.session_state["s1_files"]
+
+            with list_col:
+                with st.container(height=195, border=True):
+                    if not files:
+                        st.caption("Click 'Add files...' to add EDB files.")
+                    else:
+                        for idx, path in enumerate(files, 1):
+                            p_obj = Path(path)
+                            try:
+                                sz = f"  ({file_size(p_obj.stat().st_size)})"
+                            except OSError:
+                                sz = ""
+                            chk_key = f"s1_fchk_{path}"
+                            st.session_state[chk_key] = path in st.session_state["s1_selected"]
+                            st.checkbox(
+                                f"{idx:02d}. {p_obj.name}{sz}",
+                                key=chk_key,
+                                on_change=_toggle_file_select,
+                                args=(path, chk_key),
+                            )
+
+            selected_indices = [i for i, p in enumerate(files) if p in st.session_state["s1_selected"]]
+            can_move_up = len(selected_indices) == 1 and selected_indices[0] > 0
+            can_move_down = len(selected_indices) == 1 and selected_indices[0] < len(files) - 1
+
+            with btn_col:
+                st.button("Add files...", key="s1_add_btn", on_click=_add_files_click, width="stretch")
+                st.button(
+                    "Remove selected",
+                    key="s1_rem_btn",
+                    disabled=not selected_indices,
+                    on_click=_remove_selected_click,
+                    width="stretch",
+                )
+                st.button(
+                    "Move up",
+                    key="s1_up_btn",
+                    disabled=not can_move_up,
+                    on_click=_move_file_click,
+                    args=(-1,),
+                    width="stretch",
+                )
+                st.button(
+                    "Move down",
+                    key="s1_down_btn",
+                    disabled=not can_move_down,
+                    on_click=_move_file_click,
+                    args=(1,),
+                    width="stretch",
+                )
+                st.button(
+                    "Clear",
+                    key="s1_clr_btn",
+                    disabled=not files,
+                    on_click=_clear_files_click,
+                    width="stretch",
+                )
+
+    with col_opts:
+        with st.container(border=True):
+            st.markdown("##### Plot and fit")
+            st.checkbox(
+                "Plot radius² (otherwise radius)",
+                key="s1_squared",
+                on_change=_on_squared_change,
+            )
+            st.checkbox(
+                "100nm uncertainty (error bars, fit band, CSV error columns)",
+                key="s1_use_err",
+            )
+            f1, f2 = st.columns(2)
+            f1.text_input("Fit from (s)", key="s1_fit_lo", placeholder="start")
+            f2.text_input("to (s)", key="s1_fit_hi", placeholder="end")
+            st.caption("(blank = whole trace; or drag in Fit region mode)")
+
+    with col_corr:
+        with st.container(border=True):
+            st.markdown("##### Radius correction (`compounds.json`)")
+            comp_options = [""] + sorted(compounds)
+            st.selectbox(
+                "Compound",
+                options=comp_options,
+                format_func=lambda c: "(select compound...)" if c == "" else c,
+                key="s1_compound",
+                on_change=_on_basis_or_compound_change,
+                args=(compounds,),
+            )
+            chosen = st.session_state["s1_compound"]
+            info = compounds.get(chosen, {})
+            ri = info.get("refractive_index")
+            rho = info.get("density_g_ml")
+            factor = _factor_for(compounds, chosen)
+
+            m1, m2 = st.columns(2)
+            m1.caption(f"Refractive index: **{'—' if ri is None else f'{ri:g}'}**")
+            m2.caption(f"Density (g/mL): **{'—' if rho is None else f'{rho:g}'}**")
+
+            if chosen and ri is None:
+                st.checkbox("Confirm factor = 1.0 (no RI)", key="s1_allow_no_ri")
+
+            c_raw, c_corr = st.columns(2)
+            c_raw.checkbox(
+                "Plot raw radius",
+                key="s1_show_raw",
+                on_change=_on_basis_or_compound_change,
+                args=(compounds,),
+            )
+            c_corr.checkbox(
+                "Plot corrected radius",
+                key="s1_show_corr",
+                on_change=_on_basis_or_compound_change,
+                args=(compounds,),
+            )
+            st.caption(
+                f"EDB assumed RI {EDB_ASSUMED_RI}; factor **{factor:.4f}**. "
+                "Stage 2 and exported fits always use corrected radius."
+            )
+
+    # Action bar matching the original desktop pipeline buttons
+    a1, a2, a3, a4, a5, a6 = st.columns([1.0, 0.75, 1.0, 1.15, 1.05, 1.3])
+    load_clicked = a1.button(
+        "Load / plot",
+        type="primary",
+        key="s1_load_btn",
+        disabled=not st.session_state["s1_files"],
+        width="stretch",
+    )
+    a2.button("Fit", key="s1_fit_btn", on_click=_run_fit, args=(compounds,), width="stretch")
+    a3.button("Clear fit region", key="s1_clear_fit_btn", on_click=_on_clear_region, args=(compounds,), width="stretch")
+    save_clicked = a4.button("Save cleaned data", key="s1_save_btn", width="stretch")
+    export_clicked = a5.button("Export fit CSV", key="s1_export_btn", width="stretch")
+    next_clicked = a6.button("Next: MFS & gradients →", type="primary", key="s1_next_btn", width="stretch")
+
+    if load_clicked:
+        files = list(st.session_state["s1_files"])
+        prog = st.progress(0.0, text="Loading 0%...")
         started = time.perf_counter()
-        self.progress.run(
-            "Saving", lambda progress, cancel: write_cleaned(path, trace, factor, sigma, progress, cancel),
-            lambda count: self.status.set(f"Saved {count:,} retained rows to {Path(path).name} in "
-                                          f"{time.perf_counter() - started:.1f} s (correction factor {factor:.4f})."),
-            lambda error: messagebox.showerror("Save failed", str(error) or repr(error), parent=self),
-            lambda: self.status.set("Save cancelled; no file was written."), lock=self.file_buttons)
-
-    def number(self, key, label):
-        return parse_number(self.var[key].get(), label, optional=True)
-
-    def clear_region(self):
-        self.var["fit_lo"].set("")
-        self.var["fit_hi"].set("")
-        self.do_fit()
-
-    def do_fit(self, redraw=True):
-        if self.store is None:
-            self.fit_text.set("Load data first.")
-            return
         try:
-            scale = self.fit_scale()
-            self.fit = fit_trace(self.store, self.number("fit_lo", "Fit from"), self.number("fit_hi", "Fit to"), scale)
-            self.fit["scale"] = scale
-        except ValueError as error:
-            self.fit = None
-            self.fit_text.set(f"Fit failed: {error}")
+            t, r, skipped = read_files(
+                files,
+                progress=lambda frac: prog.progress(frac, text=f"Loading {100 * frac:.0f}%..."),
+            )
+            st.session_state["s1_store"] = PointStore(t, r)
+            st.session_state["s1_fit"] = None
+            _on_reset_zoom()
+            st.session_state["s1_status"] = (
+                f"Loaded {len(t):,} points from {len(files)} file(s) in {time.perf_counter() - started:.2f} s; "
+                f"skipped {skipped:,} non-data lines. Radius assumed in µm; time starts at 0 s."
+            )
+            st.session_state["s1_fit_text"] = "Fit: none yet. Drag in Fit region mode or click Fit for the whole trace."
+        except Exception as err:
+            st.error(f"Load error: {err}")
+        finally:
+            prog.empty()
+
+    if save_clicked:
+        store = st.session_state["s1_store"]
+        if store is None:
+            st.warning("Load data first.")
         else:
-            f = self.fit
-            basis = "corrected radius" if scale != 1.0 else "radius"
-            self.fit_text.set(
-                f"{f['label']} to {basis}, {f['lo']:.6g}-{f['hi']:.6g} s, {f['n']:,} retained points. "
-                f"RMS residual {f['rms']:.4g} µm, R² {f['r2']:.6f}. {f['detail']}")
-        if redraw:
-            self.update_plot()
-
-    def export_fit(self):
-        if self.fit is None:
-            messagebox.showinfo("No fit", "Run a fit first.", parent=self)
-            return
-        if self.require_correction("exporting the fit") is None:
-            return
-        try:
-            fit = self.corrected_fit()
-        except ValueError as error:
-            messagebox.showerror("Fit error", f"Could not fit the corrected radius: {error}", parent=self)
-            return
-        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")],
-                                            initialfile="Fitted EDB Data.csv", parent=self)
-        if not path:
-            return
-        try:
-            self.write_fit(path, fit)
-        except OSError as error:
-            messagebox.showerror("Export error", str(error), parent=self)
-            return
-        self.status.set(f"Corrected-radius fit exported ({export_points(fit):,} points, factor "
-                        f"{fit['scale']:.4f}).")
-
-    def write_fit(self, path, fit):
-        x, radius, radius2 = fit_curve(fit, export_points(fit))
-        header = ["time_s", "fitted_radius_corrected_um", "fitted_radius_corrected_squared_um2",
-                  "radius_correction_factor"]
-        columns = [x, radius, radius2, np.full_like(x, fit["scale"])]
-        if self.use_err.get():
-            sigma = RADIUS_UNCERTAINTY_UM * fit["scale"]
-            header += ["fitted_radius_corrected_err_um", "fitted_radius_corrected_lower_um",
-                       "fitted_radius_corrected_upper_um", "fitted_radius_corrected_squared_err_um2",
-                       "fitted_radius_corrected_squared_lower_um2", "fitted_radius_corrected_squared_upper_um2"]
-            columns += [np.full_like(radius, sigma), radius - sigma, radius + sigma, 2 * radius * sigma,
-                        (radius - sigma) ** 2, (radius + sigma) ** 2]
-        with open(path, "w", newline="", encoding="utf-8") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(header)
-            writer.writerows(zip(*columns))
-
-    def handoff(self):
-        """Data for stage 2: the fit on the corrected radius, and the cleaned points (raw radius, shared with this
-        stage rather than copied) with the correction factor to apply to them."""
-        if self.progress.busy:
-            messagebox.showinfo("Busy", "Wait for the file to finish loading or saving first.", parent=self)
-            return None
-        if self.store is None:
-            messagebox.showinfo("No data", "Load EDB data first.", parent=self)
-            return None
-        if self.fit is None:
-            messagebox.showinfo("No fit", "Fit the data before moving on (click Fit or drag a fit region).",
-                                parent=self)
-            return None
-        factor = self.require_correction("moving on")
-        if factor is None:
-            return None
-        try:
-            fit = self.corrected_fit()
-        except ValueError as error:
-            messagebox.showerror("Fit error", f"Could not fit the corrected radius: {error}", parent=self)
-            return None
-        x, _, radius2 = fit_curve(fit, export_points(fit))
-        return dict(edb=self.store.snapshot(), fit_t=x, fit_r2=radius2, factor=factor,
-                    sigma=RADIUS_UNCERTAINTY_UM * factor, refitted=fit is not self.fit)
-
-    def stride(self):
-        try:
-            return parse_stride(self.var["stride"].get())
-        except ValueError:
-            self.status.set("Plot every Nth point must be 'auto' or a positive whole number; using auto.")
-            return None
-
-    def draw_points(self, whole=False, force=True):
-        """Put the points to draw on the plot: those in the current x range, or of the whole trace. Returns False
-        (and leaves the plot alone) if force is off and they are the ones already drawn."""
-        if self.store is None:
-            for line in (self.data_line, self.corr_line, self.err_bars):
-                line.set_data([], [])
-            return True
-        t, r, changed = self.view.get(self.store, self.stride(), whole)
-        if not (changed or force):
-            return False
-        squared, factor = self.squared.get(), self.factor()
-        for line, s, on in ((self.data_line, 1.0, self.show_raw.get()), (self.corr_line, factor, self.show_corr.get())):
-            if on:
-                line.set_data(t, (r * s) ** 2 if squared else r * s)
+            fac, err = _check_correction(compounds, "saving")
+            if err:
+                st.warning(err)
             else:
-                line.set_data([], [])
-        if self.use_err.get():
-            step = max(1, len(t) // MAX_ERROR_BARS)
-            scale = self.fit_scale()
-            ts, rs = t[::step], r[::step] * scale
-            sigma = RADIUS_UNCERTAINTY_UM * scale
-            lower, upper = np.clip(rs - sigma, 0, None), rs + sigma
-            if squared:
-                lower, upper = lower ** 2, upper ** 2
-            x_bars = np.repeat(ts, 3)
-            y_bars = np.empty(3 * len(ts))
-            y_bars[0::3], y_bars[1::3], y_bars[2::3] = lower, upper, np.nan
-            x_bars[2::3] = np.nan
-            self.err_bars.set_data(x_bars, y_bars)
-        else:
-            self.err_bars.set_data([], [])
-        thinned = " (thinned to fit the screen: zoom in for every point)" if self.view.thinned else ""
-        self.axis.set_title(f"EDB evaporation — {self.store.count:,} retained; "
-                            f"{len(self.store) - self.store.count:,} culled; {len(t):,} drawn{thinned}", fontsize=10)
-        return True
+                out_path = ask_save_file(
+                    title="Save cleaned data",
+                    filetypes=[
+                        ("NumPy binary: saves and reloads large data in seconds (*.npz)", "*.npz"),
+                        ("CSV (*.csv)", "*.csv"),
+                    ],
+                    initial_file="Cleaned EDB Data.npz",
+                    default_ext=".npz",
+                    initial_dir=st.session_state["s1_last_dir"],
+                )
+                if out_path:
+                    target = Path(out_path)
+                    st.session_state["s1_last_dir"] = str(target.parent)
+                    if any(target.exists() and Path(p).exists() and target.samefile(p) for p in st.session_state["s1_files"]):
+                        st.error("Choose an output file different from the inputs.")
+                    else:
+                        prog = st.progress(0.0, text="Saving 0%...")
+                        started = time.perf_counter()
+                        snap = store.snapshot()
+                        sig = RADIUS_UNCERTAINTY_UM * fac if st.session_state["s1_use_err"] else None
+                        try:
+                            cnt = write_cleaned(
+                                str(target),
+                                snap,
+                                fac,
+                                sig,
+                                progress=lambda frac: prog.progress(frac, text=f"Saving {100 * frac:.0f}%..."),
+                            )
+                            st.session_state["s1_status"] = (
+                                f"Saved {cnt:,} retained rows to {target.name} in "
+                                f"{time.perf_counter() - started:.2f} s (correction factor {fac:.4f})."
+                            )
+                        except Exception as exc:
+                            st.error(f"Save failed: {exc}")
+                        finally:
+                            prog.empty()
 
-    def on_view(self):
-        """The x range has settled after a zoom or pan: draw the points of the new range."""
-        if self.store is not None and self.draw_points(force=False):
-            self.canvas.draw_idle()
-
-    def update_plot(self, rescale=False):
-        ax = self.axis
-        squared = self.squared.get()
-        show_err = self.use_err.get()
-        if not (self.show_raw.get() or self.show_corr.get()):
-            self.show_raw.set(True)
-        self.factor()  # keeps the correction-factor label up to date
-        ax.set_xlabel("Time since first point (s)")
-        name = "Corrected radius" if self.show_corr.get() and not self.show_raw.get() else "Radius"
-        ax.set_ylabel(f"{name}² (µm²)" if squared else f"{name} (µm)")
-        self.draw_points(whole=rescale)
-        if self.fit_band is not None:
-            self.fit_band.remove()
-            self.fit_band = None
-        if self.fit is not None:
-            x, radius, radius2 = fit_curve(self.fit)
-            self.fit_line.set_data(x, radius2 if squared else radius)
-            if show_err:
-                sigma = RADIUS_UNCERTAINTY_UM * self.fit["scale"]
-                lower, upper = np.clip(radius - sigma, 0, None), radius + sigma
-                if squared:
-                    lower, upper = lower ** 2, upper ** 2
-                self.fit_band = ax.fill_between(x, lower, upper, color="tab:red", alpha=0.25, linewidth=0, zorder=2)
+    if export_clicked:
+        if st.session_state["s1_fit"] is None:
+            st.warning("Run a fit first.")
         else:
-            self.fit_line.set_data([], [])
-        if rescale:
-            ax.autoscale(enable=True)
-            ax.relim()
-            ax.autoscale_view()
-        try:
-            b = parse_limits([self.var[k].get() for k in ("x_min", "x_max", "y_min", "y_max")])
-            apply_limits(ax, b[0], b[1], "x")
-            apply_limits(ax, b[2], b[3], "y")
-        except ValueError as error:
-            self.status.set(f"Axis limits ignored: {error}")
-        ax.legend(loc="best", fontsize=8)
-        self.canvas.draw_idle()
+            fac, err = _check_correction(compounds, "exporting the fit")
+            if err:
+                st.warning(err)
+            else:
+                try:
+                    c_fit = _corrected_fit(compounds)
+                    out_path = ask_save_file(
+                        title="Export fit CSV",
+                        filetypes=[("CSV (*.csv)", "*.csv")],
+                        initial_file="Fitted EDB Data.csv",
+                        default_ext=".csv",
+                        initial_dir=st.session_state["s1_last_dir"],
+                    )
+                    if out_path:
+                        st.session_state["s1_last_dir"] = str(Path(out_path).parent)
+                        _write_fit_csv(out_path, c_fit, st.session_state["s1_use_err"])
+                        st.session_state["s1_status"] = (
+                            f"Corrected-radius fit exported ({export_points(c_fit):,} points, "
+                            f"factor {c_fit['scale']:.4f})."
+                        )
+                except Exception as exc:
+                    st.error(f"Export error: {exc}")
+
+    if next_clicked:
+        data, err = stage1_handoff(compounds)
+        if err:
+            st.warning(err)
+        else:
+            on_next_stage(data)
+
+    _render_stage1_plot_fragment(compounds)
+
+
+@st.fragment
+def _render_stage1_plot_fragment(compounds):
+    with st.container(border=True):
+        m_col, u_col, ax_col = st.columns([1.6, 1.15, 1.85], vertical_alignment="center")
+        with m_col:
+            st.radio(
+                "Plot mode (drag on the plot)",
+                options=list(MODE_LABELS),
+                format_func=lambda k: MODE_LABELS[k],
+                horizontal=True,
+                key="s1_mode",
+                on_change=_on_mode_change,
+            )
+        with u_col:
+            u1, u2, u3 = st.columns(3)
+            store = st.session_state["s1_store"]
+            u1.button(
+                "Undo cull",
+                key="s1_undo_btn",
+                disabled=not (store is not None and store.history),
+                on_click=_on_undo,
+                args=(compounds,),
+                width="stretch",
+            )
+            u2.button(
+                "Restore all",
+                key="s1_restore_btn",
+                disabled=store is None or store.count == len(store),
+                on_click=_on_restore,
+                args=(compounds,),
+                width="stretch",
+            )
+            u3.button("Reset zoom", key="s1_reset_zoom_btn", on_click=_on_reset_zoom, width="stretch")
+
+        with ax_col:
+            x1, x2, y1, y2 = st.columns(4)
+            x1.text_input("X min", key="s1_xmin", placeholder="auto")
+            x2.text_input("X max", key="s1_xmax", placeholder="auto")
+            y1.text_input("Y min", key="s1_ymin", placeholder="auto")
+            y2.text_input("Y max", key="s1_ymax", placeholder="auto")
+
+    st.caption(st.session_state["s1_status"])
+    st.markdown(f"**{st.session_state['s1_fit_text']}**")
+
+    try:
+        limits = parse_limits([st.session_state[k] for k in ("s1_xmin", "s1_xmax", "s1_ymin", "s1_ymax")])
+    except ValueError as err:
+        st.warning(f"Axis limits ignored: {err}")
+        limits = (None, None, None, None)
+
+    factor = _factor_for(compounds, st.session_state["s1_compound"])
+    fig = build_stage1_figure(
+        store=st.session_state["s1_store"],
+        fit=st.session_state["s1_fit"],
+        squared=st.session_state["s1_squared"],
+        use_err=st.session_state["s1_use_err"],
+        show_raw=st.session_state["s1_show_raw"],
+        show_corr=st.session_state["s1_show_corr"],
+        factor=factor,
+        fit_scale=_fit_scale(compounds),
+        mode=st.session_state["s1_mode"],
+        limits=limits,
+        nonce=st.session_state["s1_nonce"],
+    )
+
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        key="s1_plot",
+        on_select=lambda: _on_plot_select(compounds),
+        selection_mode="box",
+        config={"displaylogo": False},
+    )

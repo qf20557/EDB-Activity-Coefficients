@@ -1,287 +1,364 @@
-"""Stage 3 publication-plot window."""
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+"""Stage 3 Publication Plot Studio for Streamlit."""
+import io
+from pathlib import Path
 
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
+import streamlit as st
 
 from ..config import COLOURS, LINE_STYLES, MARKERS, SAVE_DPI
 from ..parsing import first_line, parse_number
 from ..plotting import draw_publication
-from .widgets import scroll_column
+from .widgets import ask_save_file
 
 
-class PlotStudio(tk.Toplevel):
-    def __init__(self, master, series, xlabel, ylabel, filename="figure.png", show_xerr=True, show_yerr=True,
-                 show_band=True, show_combined=False):
-        super().__init__(master)
-        self.title("Publication plot")
-        self.geometry("1280x900")
-        self.series = series
-        self.filename = filename
-        self.last_good = None
-        self.pending = None
-        self.v = {}
+def init_studio_state(default_label="A", show_xerr=True, show_yerr=True, show_band=True, show_combined=False):
+    defaults = {
+        "ps_title": "",
+        "ps_xlabel": rf"$x_{{\mathrm{{{default_label}}}}}$",
+        "ps_ylabel": rf"$\gamma_{{\mathrm{{{default_label}}}}}$",
+        "ps_font_size": "12",
+        "ps_xscale": "linear",
+        "ps_yscale": "log",
+        "ps_xmin": "",
+        "ps_xmax": "",
+        "ps_ymin": "",
+        "ps_ymax": "",
+        "ps_legend": True,
+        "ps_grid": False,
+        "ps_xerr": show_xerr,
+        "ps_yerr": show_yerr,
+        "ps_band": show_band,
+        "ps_combined": show_combined,
+        "ps_advanced": False,
+        # AIOMFAC curve
+        "ps_aiomfac_label": "AIOMFAC",
+        "ps_aiomfac_color": "black",
+        "ps_aiomfac_style": "solid",
+        "ps_aiomfac_width": "1.2",
+        # Experiment points
+        "ps_exp_label": "Experiment",
+        "ps_exp_color": "black",
+        "ps_exp_marker": "square",
+        "ps_exp_size": "5",
+        "ps_exp_yerr_mode": "bars",
+        "ps_exp_rband_label": "radius range",
+        "ps_exp_rband_color": "black",
+        "ps_exp_rband_alpha": "0.25",
+        # Radius error bars
+        "ps_exp_bar_color": "black",
+        "ps_exp_bar_alpha": "1.0",
+        "ps_exp_bar_width": "0.8",
+        "ps_exp_bar_style": "solid",
+        "ps_exp_bar_capsize": "2",
+        "ps_exp_bar_capthick": "1.0",
+        # Combined error bars
+        "ps_exp_comb_color": "red",
+        "ps_exp_comb_alpha": "0.7",
+        "ps_exp_comb_width": "0.8",
+        "ps_exp_comb_style": "solid",
+        "ps_exp_comb_capsize": "2",
+        "ps_exp_comb_capthick": "1.0",
+        # p_vap band
+        "ps_exp_band_label": "p_vap range",
+        "ps_exp_band_color": "grey",
+        "ps_exp_band_alpha": "0.25",
+        # Figure size
+        "ps_width": "6.5",
+        "ps_height": "5",
+        "ps_last_dir": None,
+        "ps_last_good": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-        column, form, wheel = scroll_column(self)
-        column.pack(side="left", fill="y")
-        form.configure(padding=8)
-        right = ttk.Frame(self)
-        right.pack(side="left", fill="both", expand=True)
-        row = [0]
-        self.sections = []  # (header label, text, expanded var)
-        self.rows = []  # (widgets, expanded var of their section, shown() or None)
 
-        def header(text, expanded=True):
-            open_ = tk.BooleanVar(value=expanded)
-            label = ttk.Label(form, font=("TkDefaultFont", 10, "bold"), cursor="hand2")
-            label.grid(row=row[0], column=0, columnspan=2, sticky="w", pady=(8, 2))
-            label.bind("<Button-1>", lambda _: (open_.set(not open_.get()), self.refresh()))
-            self.sections.append((label, text, open_))
-            row[0] += 1
+def _num(key, label, optional=False, positive=False):
+    val = parse_number(st.session_state[key], label, optional=optional)
+    if val is not None and positive and val <= 0:
+        raise ValueError(f"{label} must be positive and finite.")
+    return val
 
-        def place(widgets, shown=None):
-            self.rows.append((widgets, self.sections[-1][2], shown))
-            row[0] += 1
 
-        def note(text, shown=None):
-            label = ttk.Label(form, text=text, font=("TkDefaultFont", 9, "italic"))
-            label.grid(row=row[0], column=0, columnspan=2, sticky="w", pady=(4, 0))
-            place((label,), shown)
+def _collect_options():
+    g = lambda k: str(st.session_state[k]).strip()
 
-        def entry(key, text, default, values=None, width=24, shown=None):
-            label = ttk.Label(form, text=text)
-            label.grid(row=row[0], column=0, sticky="w", pady=1)
-            var = tk.StringVar(value=str(default))
-            widget = (ttk.Combobox(form, textvariable=var, values=values, width=width - 3) if values
-                      else ttk.Entry(form, textvariable=var, width=width))
-            widget.grid(row=row[0], column=1, sticky="w", padx=4, pady=1)
-            if values:
-                for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                    widget.bind(sequence, wheel)  # scroll the column, not the combobox value
-            var.trace_add("write", lambda *_: self.schedule())
-            self.v[key] = var
-            place((label, widget), shown)
+    def bar_opts(prefix, label_prefix):
+        bs = g(f"ps_exp_{prefix}_style")
+        return {
+            f"{prefix}_width": _num(f"ps_exp_{prefix}_width", f"Experiment {label_prefix} line width", positive=True),
+            f"{prefix}_capsize": _num(f"ps_exp_{prefix}_capsize", f"Experiment {label_prefix} cap size"),
+            f"{prefix}_capthick": _num(
+                f"ps_exp_{prefix}_capthick", f"Experiment {label_prefix} cap thickness", positive=True
+            ),
+            f"{prefix}_style": LINE_STYLES.get(bs, bs if bs in LINE_STYLES.values() else "-"),
+        }
 
-        def check(text, var, shown=None):
-            box = ttk.Checkbutton(form, text=text, variable=var, command=self.schedule)
-            box.grid(row=row[0], column=0, columnspan=2, sticky="w")
-            place((box,), shown)
+    aiomfac_style = g("ps_aiomfac_style")
+    exp_marker = g("ps_exp_marker")
+    exp_color = g("ps_exp_color") or "black"
 
-        has = lambda key: lambda: any(s.get(key) is not None for s in self.series)
-        header("Text (use $...$ for maths, e.g. $\\gamma_{\\mathrm{A}}$)")
-        entry("title", "Title", "")
-        entry("xlabel", "X label", xlabel)
-        entry("ylabel", "Y label", ylabel)
-        entry("font_size", "Font size (pt)", "12")
-        header("Axes (limits blank = automatic)")
-        entry("xscale", "X axis", "linear", ("linear", "log"))
-        entry("yscale", "Y axis", "log", ("linear", "log"))
-        entry("xmin", "X min", "")
-        entry("xmax", "X max", "")
-        entry("ymin", "Y min", "")
-        entry("ymax", "Y max", "")
-        header("Plot elements")
-        self.legend = tk.BooleanVar(value=True)
-        self.grid_on = tk.BooleanVar(value=False)
-        self.xerr = tk.BooleanVar(value=show_xerr)
-        self.yerr = tk.BooleanVar(value=show_yerr)
-        self.band = tk.BooleanVar(value=show_band)
-        self.combined = tk.BooleanVar(value=show_combined)
-        self.advanced = tk.BooleanVar(value=False)
-        check("Legend", self.legend)
-        check("Grid", self.grid_on)
-        check("x error (radius uncertainty)", self.xerr, has("bounds"))
-        check("y error (radius uncertainty)", self.yerr, has("bounds"))
-        check("p_vap band (systematic)", self.band, has("pvap"))
-        check("Combined y error bars (radius + p_vap)", self.combined, has("pvap"))
-        check("Advanced style options (line widths, caps)", self.advanced)
-        for s in series:
-            n = s["name"]
-            header(f"{n} ({'curve' if s['kind'] == 'line' else 'points'})")
-            entry(n + ".label", "Legend label", s["label"])
-            entry(n + ".color", "Colour (name or #hex)", s["color"], COLOURS)
-            if s["kind"] == "line":
-                entry(n + ".style", "Line style", s.get("style", "solid"), tuple(LINE_STYLES))
-                entry(n + ".width", "Line width", s.get("width", 1.2))
-                continue
-            entry(n + ".marker", "Marker", s.get("marker", "square"), tuple(MARKERS))
-            entry(n + ".size", "Marker size", s.get("size", 5))
-            shown = self.visibility(s)
-            entry(n + ".yerr_mode", "Radius y error as", "bars", ("bars", "band"), shown=shown["yerr"])
-            note("Radius band", shown["rband"])
-            entry(n + ".rband_label", "Legend label", "radius range", shown=shown["rband"])
-            entry(n + ".rband_color", "Colour", s["color"], COLOURS, shown=shown["rband"])
-            entry(n + ".rband_alpha", "Alpha (0-1)", 0.25, shown=shown["rband"])
-            for prefix, text, color, alpha in (("bar", "Radius error bars", s["color"], 1.0),
-                                               ("comb", "Combined error bars", "red", 0.7)):
-                basic, advanced = shown[prefix], shown[prefix + "_advanced"]
-                note(text, basic)
-                entry(f"{n}.{prefix}_color", "Colour", color, COLOURS, shown=basic)
-                entry(f"{n}.{prefix}_alpha", "Alpha (0-1)", alpha, shown=basic)
-                entry(f"{n}.{prefix}_width", "Line width", 0.8, shown=advanced)
-                entry(f"{n}.{prefix}_style", "Line style", "solid", tuple(LINE_STYLES), shown=advanced)
-                entry(f"{n}.{prefix}_capsize", "Cap size", 2, shown=advanced)
-                entry(f"{n}.{prefix}_capthick", "Cap thickness", 1.0, shown=advanced)
-            note("p_vap band", shown["band"])
-            entry(n + ".band_label", "Legend label", "p_vap range", shown=shown["band"])
-            entry(n + ".band_color", "Colour", "grey", COLOURS, shown=shown["band"])
-            entry(n + ".band_alpha", "Alpha (0-1)", 0.25, shown=shown["band"])
-        header("Figure size", expanded=False)
-        entry("width", "Width (in)", "6.5")
-        entry("height", "Height (in)", "5")
-        ttk.Button(form, text=f"Save figure ({SAVE_DPI} dpi)...", command=self.save).grid(
-            row=row[0], column=0, columnspan=2, sticky="ew", pady=(10, 2))
-        self.status = tk.StringVar(value="Edits update the preview as you type.")
-        ttk.Label(form, textvariable=self.status, wraplength=300, foreground="#444").grid(
-            row=row[0] + 1, column=0, columnspan=2, sticky="w")
+    styles = {
+        "AIOMFAC": dict(
+            label=st.session_state["ps_aiomfac_label"],
+            color=g("ps_aiomfac_color") or "black",
+            style=LINE_STYLES.get(aiomfac_style, aiomfac_style if aiomfac_style in LINE_STYLES.values() else "-"),
+            width=_num("ps_aiomfac_width", "AIOMFAC line width", positive=True),
+            marker="s",
+            size=5.0,
+            bar_color="black",
+            bar_alpha=1.0,
+            band_label="p_vap range",
+            band_color="grey",
+            band_alpha=0.25,
+            comb_color="red",
+            comb_alpha=0.7,
+            yerr_mode="bars",
+            rband_label="radius range",
+            rband_color="black",
+            rband_alpha=0.25,
+            bar_width=0.8,
+            bar_capsize=2.0,
+            bar_capthick=1.0,
+            bar_style="-",
+            comb_width=0.8,
+            comb_capsize=2.0,
+            comb_capthick=1.0,
+            comb_style="-",
+        ),
+        "Experiment": dict(
+            label=st.session_state["ps_exp_label"],
+            color=exp_color,
+            marker=MARKERS.get(exp_marker, exp_marker if exp_marker in MARKERS.values() else "s"),
+            size=_num("ps_exp_size", "Experiment marker size", positive=True),
+            style="-",
+            width=1.2,
+            yerr_mode="band" if g("ps_exp_yerr_mode") == "band" else "bars",
+            rband_label=g("ps_exp_rband_label") or "radius range",
+            rband_color=g("ps_exp_rband_color") or exp_color,
+            rband_alpha=_num("ps_exp_rband_alpha", "Experiment radius band alpha"),
+            bar_color=g("ps_exp_bar_color") or exp_color,
+            bar_alpha=_num("ps_exp_bar_alpha", "Experiment error bar alpha"),
+            comb_color=g("ps_exp_comb_color") or "red",
+            comb_alpha=_num("ps_exp_comb_alpha", "Experiment combined bar alpha"),
+            band_label=g("ps_exp_band_label") or "p_vap range",
+            band_color=g("ps_exp_band_color") or "grey",
+            band_alpha=_num("ps_exp_band_alpha", "Experiment p_vap band alpha"),
+            **bar_opts("bar", "radius bar"),
+            **bar_opts("comb", "combined bar"),
+        ),
+    }
 
-        self.fig = Figure(figsize=(6.5, 5), dpi=100)
-        self.ax = self.fig.add_subplot(111)
-        holder = ttk.Frame(right)
-        holder.pack(expand=True)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=holder)
-        self.canvas.get_tk_widget().pack()
-        self.refresh()
-        self.update_plot()
+    return dict(
+        title=st.session_state["ps_title"],
+        xlabel=st.session_state["ps_xlabel"],
+        ylabel=st.session_state["ps_ylabel"],
+        font_size=_num("ps_font_size", "Font size", positive=True),
+        xscale=g("ps_xscale") if g("ps_xscale") in ("linear", "log") else "linear",
+        yscale=g("ps_yscale") if g("ps_yscale") in ("linear", "log") else "linear",
+        xmin=_num("ps_xmin", "X min", optional=True),
+        xmax=_num("ps_xmax", "X max", optional=True),
+        ymin=_num("ps_ymin", "Y min", optional=True),
+        ymax=_num("ps_ymax", "Y max", optional=True),
+        legend=st.session_state["ps_legend"],
+        grid=st.session_state["ps_grid"],
+        xerr=st.session_state["ps_xerr"],
+        yerr=st.session_state["ps_yerr"],
+        band=st.session_state["ps_band"],
+        combined=st.session_state["ps_combined"],
+        series=styles,
+        width=_num("ps_width", "Width", positive=True),
+        height=_num("ps_height", "Height", positive=True),
+    )
 
-    def visibility(self, s):
-        """shown() predicates for the uncertainty settings of points series s: only what is currently drawn."""
-        n = s["name"]
-        bounds = lambda: s.get("bounds") is not None
-        pvap = lambda: s.get("pvap") is not None
-        y_band = lambda: self.v[n + ".yerr_mode"].get().strip() == "band"
-        bars = lambda: bounds() and (self.xerr.get() or (self.yerr.get() and not y_band()))
-        comb = lambda: pvap() and self.combined.get()
-        return dict(yerr=lambda: bounds() and self.yerr.get(),
-                    rband=lambda: bounds() and self.yerr.get() and y_band(),
-                    bar=bars, bar_advanced=lambda: bars() and self.advanced.get(),
-                    comb=comb, comb_advanced=lambda: comb() and self.advanced.get(),
-                    band=lambda: pvap() and self.band.get())
 
-    def refresh(self):
-        """Show only the settings that apply now; collapsed sections hide their rows."""
-        for label, text, open_ in self.sections:
-            label.configure(text=f"{'▾' if open_.get() else '▸'} {text}")
-        for widgets, open_, shown in self.rows:
-            visible = open_.get() and (shown is None or shown())
-            for widget in widgets:
-                widget.grid() if visible else widget.grid_remove()
+def render_publication_bytes(series, options, fmt="png", dpi=130):
+    fig = Figure(figsize=(options["width"], options["height"]), dpi=dpi)
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    draw_publication(ax, series, options)
+    fig.tight_layout()
+    canvas.draw()
+    buf = io.BytesIO()
+    fig.savefig(buf, format=fmt, dpi=dpi, facecolor="white")
+    return buf.getvalue()
 
-    def set_data(self, data):
-        """data: {series name: (x, y), (x, y, bounds), (x, y, bounds, pvap) or None}; pvap is pvap_bounds output.
-        Style edits are kept."""
-        for s in self.series:
-            xy = data.get(s["name"]) or (None, None)
-            s["x"], s["y"] = xy[:2]
-            s["bounds"] = xy[2] if len(xy) > 2 else None
-            s["pvap"] = xy[3] if len(xy) > 3 else None
-        self.schedule()
 
-    def schedule(self):
-        self.refresh()
-        if self.pending is not None:
-            self.after_cancel(self.pending)
-        self.pending = self.after(40, self.update_plot)
+def _save_publication_file(path, series, options):
+    fig = Figure(figsize=(options["width"], options["height"]), dpi=SAVE_DPI)
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    draw_publication(ax, series, options)
+    fig.tight_layout()
+    canvas.draw()
+    fig.savefig(path, dpi=SAVE_DPI, facecolor="white")
 
-    def number(self, key, label, optional=False, positive=False):
-        value = parse_number(self.v[key].get(), label, optional)
-        if value is not None and positive and value <= 0:
-            raise ValueError(f"{label} must be positive and finite.")
-        return value
 
-    def options(self):
-        get = lambda k: self.v[k].get()
-        styles = {}
-        for s in self.series:
-            n = s["name"]
-            marker = get(n + ".marker").strip() if n + ".marker" in self.v else "square"
-            style = get(n + ".style").strip() if n + ".style" in self.v else "solid"
-            color = get(n + ".color").strip()
-            text = lambda key, default: get(n + key).strip() if n + key in self.v else default
-            alpha = lambda key, default: self.number(n + key, f"{n} alpha") if n + key in self.v else default
-            bars = {}
-            for prefix, text_label in (("bar", "radius bar"), ("comb", "combined bar")):
-                number = lambda key, label, default, positive=True: (
-                    self.number(f"{n}.{prefix}_{key}", f"{n} {text_label} {label}", positive=positive)
-                    if f"{n}.{prefix}_{key}" in self.v else default)
-                bar_style = text(f".{prefix}_style", "solid")
-                bars.update({
-                    f"{prefix}_width": number("width", "line width", 0.8),
-                    f"{prefix}_capsize": number("capsize", "cap size", 2.0, positive=False),
-                    f"{prefix}_capthick": number("capthick", "cap thickness", 1.0),
-                    f"{prefix}_style": LINE_STYLES.get(bar_style, bar_style if bar_style in LINE_STYLES.values() else "-")})
-            styles[n] = dict(
-                bar_color=text(".bar_color", "") or color, bar_alpha=alpha(".bar_alpha", 1.0),
-                band_label=text(".band_label", "p_vap range"), band_color=text(".band_color", "grey"),
-                band_alpha=alpha(".band_alpha", 0.25), comb_color=text(".comb_color", "") or "red",
-                comb_alpha=alpha(".comb_alpha", 0.7), **bars,
-                yerr_mode="band" if text(".yerr_mode", "bars") == "band" else "bars",
-                rband_label=text(".rband_label", "radius range"), rband_color=text(".rband_color", "") or color,
-                rband_alpha=alpha(".rband_alpha", 0.25),
-                label=get(n + ".label"), color=color,
-                marker=MARKERS.get(marker, marker if marker in MARKERS.values() else "s"),
-                size=self.number(n + ".size", n + " marker size", positive=True) if n + ".size" in self.v else 5.0,
-                style=LINE_STYLES.get(style, style if style in LINE_STYLES.values() else "-"),
-                width=self.number(n + ".width", n + " line width", positive=True) if n + ".width" in self.v else 1.2)
-        return dict(
-            title=get("title"), xlabel=get("xlabel"), ylabel=get("ylabel"),
-            font_size=self.number("font_size", "Font size", positive=True),
-            xscale=get("xscale") if get("xscale") in ("linear", "log") else "linear",
-            yscale=get("yscale") if get("yscale") in ("linear", "log") else "linear",
-            xmin=self.number("xmin", "X min", True), xmax=self.number("xmax", "X max", True),
-            ymin=self.number("ymin", "Y min", True), ymax=self.number("ymax", "Y max", True),
-            legend=self.legend.get(), grid=self.grid_on.get(), xerr=self.xerr.get(), yerr=self.yerr.get(),
-            band=self.band.get(), combined=self.combined.get(),
-            series=styles,
-            width=self.number("width", "Width", positive=True), height=self.number("height", "Height", positive=True))
+def render_plot_studio(curve, points, bounds, unc, default_label="A"):
+    init_studio_state(default_label=default_label)
 
-    def render(self, o):
-        width, height = o["width"], o["height"]
-        dpi = min(100.0, 760.0 / width, 640.0 / height)
-        self.fig.set_size_inches(width, height)
-        self.fig.set_dpi(dpi)
-        self.canvas.get_tk_widget().config(width=int(width * dpi), height=int(height * dpi))
-        draw_publication(self.ax, self.series, o)
-        self.fig.tight_layout()
-        self.canvas.draw()  # synchronous, so unfinished maths such as "$x_{$" is caught here
+    has_bounds = bounds is not None
+    has_pvap = unc is not None
 
-    def update_plot(self):
-        self.pending = None
+    series = [
+        dict(
+            name="AIOMFAC",
+            kind="line",
+            x=None if curve is None else curve[0],
+            y=None if curve is None else curve[1],
+        ),
+        dict(
+            name="Experiment",
+            kind="points",
+            x=None if points is None else points[0],
+            y=None if points is None else points[1],
+            bounds=bounds,
+            pvap=unc,
+        ),
+    ]
+
+    col_settings, col_preview = st.columns([1.05, 1.35], gap="large")
+
+    with col_settings:
+        with st.expander("Text (use $...$ for maths, e.g. $\\gamma_{\\mathrm{A}}$)", expanded=True):
+            st.text_input("Title", key="ps_title")
+            t1, t2, t3 = st.columns([1.2, 1.2, 0.8])
+            t1.text_input("X label", key="ps_xlabel")
+            t2.text_input("Y label", key="ps_ylabel")
+            t3.text_input("Font size (pt)", key="ps_font_size")
+
+        with st.expander("Axes (limits blank = automatic)", expanded=True):
+            s1, s2 = st.columns(2)
+            s1.selectbox("X axis", ("linear", "log"), key="ps_xscale")
+            s2.selectbox("Y axis", ("log", "linear"), key="ps_yscale")
+            l1, l2, l3, l4 = st.columns(4)
+            l1.text_input("X min", key="ps_xmin", placeholder="auto")
+            l2.text_input("X max", key="ps_xmax", placeholder="auto")
+            l3.text_input("Y min", key="ps_ymin", placeholder="auto")
+            l4.text_input("Y max", key="ps_ymax", placeholder="auto")
+
+        with st.expander("Plot elements", expanded=True):
+            e1, e2 = st.columns(2)
+            e1.checkbox("Legend", key="ps_legend")
+            e2.checkbox("Grid", key="ps_grid")
+            if has_bounds:
+                b1, b2 = st.columns(2)
+                b1.checkbox("x error (radius uncertainty)", key="ps_xerr")
+                b2.checkbox("y error (radius uncertainty)", key="ps_yerr")
+            if has_pvap:
+                p1, p2 = st.columns(2)
+                p1.checkbox("p_vap band (systematic)", key="ps_band")
+                p2.checkbox("Combined y error bars (radius + p_vap)", key="ps_combined")
+            st.checkbox("Advanced style options (line widths, caps)", key="ps_advanced")
+
+        with st.expander("AIOMFAC (curve)", expanded=False):
+            st.text_input("Legend label", key="ps_aiomfac_label")
+            st.text_input(f"Colour ({', '.join(COLOURS[:5])}... or #hex)", key="ps_aiomfac_color")
+            a1, a2 = st.columns(2)
+            a1.selectbox("Line style", tuple(LINE_STYLES), key="ps_aiomfac_style")
+            a2.text_input("Line width", key="ps_aiomfac_width")
+
+        with st.expander("Experiment (points)", expanded=False):
+            st.text_input("Legend label", key="ps_exp_label")
+            st.text_input(f"Colour ({', '.join(COLOURS[:5])}... or #hex)", key="ps_exp_color")
+            m1, m2 = st.columns(2)
+            m1.selectbox("Marker", tuple(MARKERS), key="ps_exp_marker")
+            m2.text_input("Marker size", key="ps_exp_size")
+
+            y_band = st.session_state["ps_exp_yerr_mode"] == "band"
+            if has_bounds and st.session_state["ps_yerr"]:
+                st.selectbox("Radius y error as", ("bars", "band"), key="ps_exp_yerr_mode")
+                y_band = st.session_state["ps_exp_yerr_mode"] == "band"
+                if y_band:
+                    st.markdown("*Radius band*")
+                    rb1, rb2, rb3 = st.columns(3)
+                    rb1.text_input("Band label", key="ps_exp_rband_label")
+                    rb2.text_input("Band colour", key="ps_exp_rband_color")
+                    rb3.text_input("Alpha (0-1)", key="ps_exp_rband_alpha")
+
+            show_bars = has_bounds and (st.session_state["ps_xerr"] or (st.session_state["ps_yerr"] and not y_band))
+            if show_bars:
+                st.markdown("*Radius error bars*")
+                eb1, eb2 = st.columns(2)
+                eb1.text_input("Bar colour", key="ps_exp_bar_color")
+                eb2.text_input("Bar alpha (0-1)", key="ps_exp_bar_alpha")
+                if st.session_state["ps_advanced"]:
+                    adv1, adv2, adv3, adv4 = st.columns(4)
+                    adv1.text_input("Width", key="ps_exp_bar_width")
+                    adv2.selectbox("Style", tuple(LINE_STYLES), key="ps_exp_bar_style")
+                    adv3.text_input("Cap size", key="ps_exp_bar_capsize")
+                    adv4.text_input("Cap thick", key="ps_exp_bar_capthick")
+
+            if has_pvap and st.session_state["ps_combined"]:
+                st.markdown("*Combined error bars*")
+                cb1, cb2 = st.columns(2)
+                cb1.text_input("Combined colour", key="ps_exp_comb_color")
+                cb2.text_input("Combined alpha (0-1)", key="ps_exp_comb_alpha")
+                if st.session_state["ps_advanced"]:
+                    ca1, ca2, ca3, ca4 = st.columns(4)
+                    ca1.text_input("Width", key="ps_exp_comb_width")
+                    ca2.selectbox("Style", tuple(LINE_STYLES), key="ps_exp_comb_style")
+                    ca3.text_input("Cap size", key="ps_exp_comb_capsize")
+                    ca4.text_input("Cap thick", key="ps_exp_comb_capthick")
+
+            if has_pvap and st.session_state["ps_band"]:
+                st.markdown("*p_vap band*")
+                pb1, pb2, pb3 = st.columns(3)
+                pb1.text_input("p_vap label", key="ps_exp_band_label")
+                pb2.text_input("p_vap colour", key="ps_exp_band_color")
+                pb3.text_input("p_vap alpha (0-1)", key="ps_exp_band_alpha")
+
+        with st.expander("Figure size", expanded=False):
+            wh1, wh2 = st.columns(2)
+            wh1.text_input("Width (in)", key="ps_width")
+            wh2.text_input("Height (in)", key="ps_height")
+
+        save_fig_clicked = st.button(f"Save figure ({SAVE_DPI} dpi)...", type="primary", key="ps_save_btn",
+                                     width="stretch")
+
+    with col_preview:
+        valid_opts = None
         try:
-            o = self.options()
-            self.render(o)
-            self.last_good = o
-            self.status.set("Preview up to date.")
-        except Exception as error:
-            self.status.set(f"Not updated: {first_line(error)}")
-            if self.last_good is not None:
+            opts = _collect_options()
+            preview_png = render_publication_bytes(series, opts, fmt="png", dpi=130)
+            st.session_state["ps_last_good"] = opts
+            valid_opts = opts
+            st.caption("Preview up to date.")
+        except Exception as err:
+            st.warning(f"Not updated: {first_line(err)}")
+            if st.session_state["ps_last_good"] is not None:
                 try:
-                    self.render(self.last_good)
+                    preview_png = render_publication_bytes(series, st.session_state["ps_last_good"], fmt="png", dpi=130)
                 except Exception:
-                    pass
+                    preview_png = None
+            else:
+                preview_png = None
 
-    def save(self):
-        try:
-            o = self.options()
-            self.render(o)
-        except Exception as error:
-            messagebox.showerror("Cannot save", first_line(error), parent=self)
-            return
-        path = filedialog.asksaveasfilename(
-            parent=self, defaultextension=".png", initialfile=self.filename,
-            filetypes=[("PNG", "*.png"), ("TIFF", "*.tiff *.tif"), ("PDF (vector)", "*.pdf"),
-                       ("SVG (vector)", "*.svg"), ("EPS (vector)", "*.eps")])
-        if not path:
-            return
-        self.config(cursor="watch")
-        self.update_idletasks()
-        try:
-            self.fig.set_size_inches(o["width"], o["height"])
-            self.fig.savefig(path, dpi=SAVE_DPI, facecolor="white")
-            self.status.set(f"Saved at {SAVE_DPI} dpi: {path}")
-        except Exception as error:
-            messagebox.showerror("Save failed", str(error), parent=self)
-        finally:
-            self.config(cursor="")
-            self.render(o)
+        if preview_png is not None:
+            st.image(preview_png, width="content")
+
+        if save_fig_clicked:
+            if valid_opts is None:
+                st.error("Fix the plot settings error before saving.")
+            else:
+                out_path = ask_save_file(
+                    title="Save publication figure",
+                    filetypes=[
+                        ("PNG (*.png)", "*.png"),
+                        ("TIFF (*.tiff;*.tif)", "*.tiff;*.tif"),
+                        ("PDF (vector) (*.pdf)", "*.pdf"),
+                        ("SVG (vector) (*.svg)", "*.svg"),
+                        ("EPS (vector) (*.eps)", "*.eps"),
+                    ],
+                    initial_file="activity_coefficient.png",
+                    default_ext=".png",
+                    initial_dir=st.session_state["ps_last_dir"],
+                )
+                if out_path:
+                    st.session_state["ps_last_dir"] = str(Path(out_path).parent)
+                    try:
+                        _save_publication_file(out_path, series, valid_opts)
+                        st.success(f"Saved at {SAVE_DPI} dpi: {out_path}")
+                    except Exception as exc:
+                        st.error(f"Save failed: {exc}")

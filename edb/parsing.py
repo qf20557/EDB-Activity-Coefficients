@@ -3,7 +3,7 @@ import math
 
 
 def parse_number(text, label, optional=False):
-    text = text.strip()
+    text = str(text).strip()
     if not text:
         if optional:
             return None
@@ -17,20 +17,9 @@ def parse_number(text, label, optional=False):
     return value
 
 
-def parse_stride(text):
-    """The 'Plot every Nth point' box: None for automatic (blank or 'auto'), otherwise a positive whole number."""
-    text = text.strip().lower()
-    if text in ("", "auto"):
-        return None
-    stride = int(text)
-    if stride < 1:
-        raise ValueError("Plot every Nth point must be 'auto' or a positive whole number.")
-    return stride
-
-
 def parse_bin_width(text):
     """The 'Bin width' box: None for automatic (blank or 'auto'), otherwise a number of seconds."""
-    if text.strip().lower() in ("", "auto"):
+    if str(text).strip().lower() in ("", "auto"):
         return None
     return parse_number(text, "Bin width")
 

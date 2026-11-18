@@ -1,0 +1,6 @@
+[server]
+maxUploadSize = 10240
+maxMessageSize = 1000
+
+[browser]
+gatherUsageStats = false

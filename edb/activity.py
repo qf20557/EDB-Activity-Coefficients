@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from .config import CSV_COLUMNS, PVAP_COLUMNS, THEORY_CHECK, THEORY_G, THEORY_P, THEORY_SIGMA, THEORY_X
+from .raw_data import open_source
 
 
 def sort_mfs_gradient(x, g, extra=None):
@@ -22,7 +23,8 @@ def sort_mfs_gradient(x, g, extra=None):
 
 def read_mfs_gradient(path):
     """(MFS, gradient, extra). extra holds the uncertainty columns of a stage 2 export, or None."""
-    df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    with open_source(path) as handle:
+        df = pd.read_csv(handle, sep=None, engine="python", encoding="utf-8-sig")
     if df.shape[1] < 2:
         raise ValueError("The CSV needs two columns: Average MFS and Gradient.")
     x = pd.to_numeric(df.iloc[:, 0], errors="coerce").to_numpy(float)
@@ -81,7 +83,8 @@ def read_theory_csv(path):
     (no uncertainty columns) or a dict: p, p_lower, p_upper (Pa, or None), sigma (gradient uncertainty aligned with
     the returned MFS, or None) and check (worst deviation of bound-run gradient / nominal gradient from p_bound / p,
     or None). The bound-run columns are only used for that check: the lower run does not reach low MFS."""
-    df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    with open_source(path) as handle:
+        df = pd.read_csv(handle, sep=None, engine="python", encoding="utf-8-sig")
     cols = {column_key(c): c for c in df.columns}
     if column_key(THEORY_X) not in cols or column_key(THEORY_G) not in cols:
         return (*read_mfs_gradient(path)[:2], None)

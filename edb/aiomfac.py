@@ -1,15 +1,22 @@
 """Stage 3: AIOMFAC-web output files."""
+import os
 import re
 
 import numpy as np
 import pandas as pd
 
-from .config import AIOMFAC_COLUMN, AIOMFAC_DIR
+from .config import AIOMFAC_COLUMN, AIOMFAC_COMPONENT, AIOMFAC_DIR
 
 
 def parse_aiomfac(path):
-    with open(path, encoding="utf-8-sig", errors="replace") as handle:
-        lines = handle.read().splitlines()
+    if isinstance(path, (str, os.PathLike)):
+        with open(path, encoding="utf-8-sig", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    else:
+        path.seek(0)
+        raw = path.read()
+        text = raw.decode("utf-8-sig", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        lines = text.splitlines()
     tables, i = {}, 0
     while i < len(lines):
         match = re.match(r"\s*Mixture's component # :\s*(\d+)", lines[i])
@@ -44,7 +51,7 @@ def aiomfac_simulations(folder=AIOMFAC_DIR):
     return sorted((p.relative_to(folder).as_posix() for p in folder.rglob("*.txt")), key=str.lower)
 
 
-def aiomfac_curve(tables, component, quantity=AIOMFAC_COLUMN):
+def aiomfac_curve(tables, component=AIOMFAC_COMPONENT, quantity=AIOMFAC_COLUMN):
     if component not in tables:
         raise ValueError(f"Component {component} not in file (found: {', '.join(tables)}).")
     df = tables[component]

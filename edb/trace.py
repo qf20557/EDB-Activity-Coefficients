@@ -2,36 +2,11 @@
 import numpy as np
 
 from . import config
+from .fast import is_sorted_fast, value_bounds_fast
 
 
 class Cancelled(Exception):
     """Raised inside a long read or write when the user cancels it."""
-
-
-def _is_sorted(t):
-    rows = config.CHUNK_ROWS
-    for a in range(0, len(t) - 1, rows):
-        block = t[a:a + rows + 1]
-        if np.any(block[1:] < block[:-1]):
-            return False
-    return True
-
-
-def _extremes(r, keep, bucket, first):
-    """Row numbers of the lowest and highest retained radius in each run of `bucket` rows; r starts at row `first`."""
-    if keep.all():
-        low = high = r
-    else:
-        low, high = np.where(keep, r, np.inf), np.where(keep, r, -np.inf)
-    rows = len(r) // bucket
-    full = rows * bucket
-    found = []
-    if rows:
-        base = first + np.arange(rows) * bucket
-        found += [base + low[:full].reshape(rows, bucket).argmin(1), base + high[:full].reshape(rows, bucket).argmax(1)]
-    if full < len(r):
-        found.append(np.array([first + full + low[full:].argmin(), first + full + high[full:].argmax()]))
-    return found
 
 
 class Trace:
@@ -41,8 +16,9 @@ class Trace:
         self.t, self.r = t, r
         self.keep = np.ones(len(t), dtype=bool) if keep is None else keep
         self.count = int(np.count_nonzero(self.keep))
-        self.sorted = _is_sorted(t) if is_sorted is None else is_sorted
+        self.sorted = is_sorted_fast(t) if is_sorted is None else is_sorted
         self.version = 0  # changes whenever keep changes
+        self._bounds_cache = {}
 
     def __len__(self):
         return len(self.t)
@@ -88,31 +64,22 @@ class Trace:
         if self.sorted:
             a, b = int(self.keep.argmax()), len(self.keep) - 1 - int(self.keep[::-1].argmax())
             return float(self.t[a]), float(self.t[b])
-        lows, highs = zip(*((t.min(), t.max()) for t, _ in self.blocks()))
-        return float(min(lows)), float(max(highs))
+        _, t_lo, t_hi, _, _ = self.bounds()
+        return t_lo, t_hi
+
+    def bounds(self, lo=None, hi=None):
+        """(count, t_min, t_max, r_min, r_max) of retained rows in [lo, hi], cached per keep-mask version."""
+        key = (self.version, None if lo is None else float(lo), None if hi is None else float(hi))
+        cached = self._bounds_cache.get(key)
+        if cached is not None:
+            return cached
+        start, stop = self.window(lo, hi)
+        res = value_bounds_fast(self.t, self.r, self.keep, start, stop, lo, hi)
+        if len(self._bounds_cache) > 16:
+            self._bounds_cache.clear()
+        self._bounds_cache[key] = res
+        return res
 
     def snapshot(self):
         """A trace that shares the data but not the keep mask, so later culls here do not change it."""
         return Trace(self.t, self.r, self.keep.copy(), self.sorted)
-
-    def display(self, lo=None, hi=None, stride=None, budget=None):
-        """(t, r) to draw. With a stride: every stride-th row of the whole trace. Without (auto): the rows with
-        lo <= t <= hi, all of them if they fit the budget; otherwise half the budget is an even sample and half is the
-        lowest and highest radius of each run of rows, so no spike is hidden however far the trace is thinned."""
-        if stride is not None:
-            t, r, keep = self.t[::stride], self.r[::stride], self.keep[::stride]
-            return (t, r) if keep.all() else (t[keep], r[keep])
-        budget = budget or config.MAX_PLOT_POINTS
-        start, stop = self.window(lo, hi)
-        if stop - start <= budget:
-            rows = np.arange(start, stop)
-        else:
-            bucket = -(-(stop - start) // (budget // 4))
-            step = bucket * max(1, config.CHUNK_ROWS // bucket)
-            found = [np.arange(start, stop, max(1, (stop - start) // (budget // 2)))]
-            for a in range(start, stop, step):
-                b = min(a + step, stop)
-                found += _extremes(self.r[a:b], self.keep[a:b], bucket, a)
-            rows = np.unique(np.concatenate(found))
-        rows = rows[self.keep[rows]]
-        return self.t[rows], self.r[rows]

@@ -8,16 +8,18 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 COMPOUNDS_PATH = ROOT / "compounds.json"
 
-# Big data: traces are read, fitted, culled, drawn and saved block by block, never copied whole
+# Big data: traces are read, fitted, culled, rasterized and saved block by block, never copied whole
 READ_BLOCK_BYTES = 16 << 20  # raw files are parsed in blocks of this many bytes
-READ_THREADS = max(1, min(4, (os.cpu_count() or 2) // 2))  # blocks parsed at once
+READ_THREADS = max(1, min(8, os.cpu_count() or 4))  # blocks parsed concurrently
 CHUNK_ROWS = 1 << 20  # rows per block for in-memory work
-WRITE_ROWS = 100_000  # rows per block when saving (sets how often progress and Cancel are checked)
-MAX_PLOT_POINTS = 40_000  # points drawn when 'Plot every Nth point' is auto
+WRITE_ROWS = 250_000  # rows per block when saving (sets how often progress and Cancel are checked)
+
+# All-points raster canvas resolution (every retained point is projected onto this grid, zero decimation)
+RASTER_WIDTH = 1800
+RASTER_HEIGHT = 800
 
 # Stage 1 (EDB Plotter)
 RADIUS_UNCERTAINTY_UM = 0.1
-MAX_ERROR_BARS = 20000  # error bars are thinned to this many; at that density they overlap into a band anyway
 MAX_FIT_BINS = 3000
 # The exported fit CSV and the fit handed to stage 2 are the same points: at least FIT_EXPORT_POINTS, and on a long
 # trace one every FIT_EXPORT_STEP seconds (up to the maximum), so that every stage 2 bin holds plenty of them
@@ -40,7 +42,8 @@ CSV_COLUMNS = ["Average MFS", "Gradient (um2/s)", "Average MFS (radius - unc)", 
 LIMIT_KEYS = (("X min (s)", "x_min"), ("X max (s)", "x_max"), ("Y min", "y_min"), ("Y max", "y_max"))
 
 # Stage 3 (EDB Activity Coefficients)
-AIOMFAC_COLUMN = "a_x"
+AIOMFAC_COLUMN = "a_coeff_x"
+AIOMFAC_COMPONENT = "01"
 AIOMFAC_DIR = ROOT / "AIOMFAC simulations"
 SAVE_DPI = 1200
 # theoretical (DropletLab) CSV columns, matched by name (see column_key); older 2-column files are read by position

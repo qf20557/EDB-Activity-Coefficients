@@ -4,7 +4,7 @@ import math
 import numpy as np
 
 from .config import DICT_TAUS, FIT_EXPORT_POINTS, FIT_EXPORT_STEP, MAX_FIT_BINS, MAX_FIT_EXPORT_POINTS
-from .trace import Trace
+from .fast import scan_and_bin_trace
 
 
 def _nnls(A, b):
@@ -33,13 +33,6 @@ def _nnls(A, b):
     return x
 
 
-def bin_series(t, y, max_bins=MAX_FIT_BINS):
-    """(time, mean, count, within-bin sum of squares) for arrays; fit_trace does the same block by block."""
-    if len(t) <= max_bins:
-        return t, y, np.ones(len(t)), 0.0
-    return _bin_blocks([(t, y)], float(t.min()), float(t.max()), max_bins)
-
-
 def _bin_blocks(blocks, lo, hi, max_bins=MAX_FIT_BINS):
     count, sum_t, sum_y, sum_yy = (np.zeros(max_bins) for _ in range(4))
     for t, y in blocks:
@@ -62,36 +55,38 @@ def _solve_decays(u, y, sw, taus):
     return x[0], x[1:], float(resid @ resid)
 
 
-def fit_model(t, r, lo=None, hi=None):
-    """Fit arrays of time and radius; see fit_trace."""
-    return fit_trace(Trace(t, r), lo, hi)
-
-
 def fit_trace(trace, lo=None, hi=None, scale=1.0):
-    """Fit scale * radius of the retained rows of a Trace with lo <= t <= hi. The trace is read in blocks (once to
-    count, once to bin), so no copy of it is made however long it is."""
+    """Fit scale * radius of the retained rows of a Trace with lo <= t <= hi. The trace is read in blocks (or a single
+    compiled Numba pass on large traces), so no copy of it is made however long it is."""
     first, last = trace.time_range()
     lo = first if lo is None else lo
     hi = last if hi is None else hi
     if lo >= hi:
         raise ValueError("Fit start must be below fit end.")
 
-    n, t_lo, t_hi, distinct, small = 0, math.inf, -math.inf, np.empty(0), []
-    for tt, rr in trace.blocks(lo, hi):
-        n += len(tt)
-        t_lo, t_hi = min(t_lo, float(tt.min())), max(t_hi, float(tt.max()))
-        if len(distinct) < 10:
-            distinct = np.unique(np.concatenate([distinct, tt]))
-        if n <= MAX_FIT_BINS:
-            small.append((tt, rr * scale))
-    if n < 10 or len(distinct) < 10:
-        raise ValueError("Need at least 10 retained points at distinct times for this model.")
-    span = t_hi - t_lo
-    if n <= MAX_FIT_BINS:
-        tb, rb = (np.concatenate(column) for column in zip(*small))
-        wb, within = np.ones(n), 0.0
+    fast_res = scan_and_bin_trace(trace, lo, hi, scale, MAX_FIT_BINS)
+    if fast_res is not None:
+        n, t_lo, t_hi, n_distinct, tb, rb, wb, within = fast_res
+        if n < 10 or n_distinct < 10:
+            raise ValueError("Need at least 10 retained points at distinct times for this model.")
     else:
-        tb, rb, wb, within = _bin_blocks(((tt, rr * scale) for tt, rr in trace.blocks(lo, hi)), t_lo, t_hi)
+        n, t_lo, t_hi, distinct, small = 0, math.inf, -math.inf, np.empty(0), []
+        for tt, rr in trace.blocks(lo, hi):
+            n += len(tt)
+            t_lo, t_hi = min(t_lo, float(tt.min())), max(t_hi, float(tt.max()))
+            if len(distinct) < 10:
+                distinct = np.unique(np.concatenate([distinct, tt]))
+            if n <= MAX_FIT_BINS:
+                small.append((tt, rr * scale))
+        if n < 10 or len(distinct) < 10:
+            raise ValueError("Need at least 10 retained points at distinct times for this model.")
+        if n <= MAX_FIT_BINS:
+            tb, rb = (np.concatenate(column) for column in zip(*small))
+            wb, within = np.ones(n), 0.0
+        else:
+            tb, rb, wb, within = _bin_blocks(((tt, rr * scale) for tt, rr in trace.blocks(lo, hi)), t_lo, t_hi)
+
+    span = t_hi - t_lo
     u, sw = (tb - t_lo) / span, np.sqrt(wb)
     offset, amps, _ = _solve_decays(u, rb, sw, DICT_TAUS)
     used = amps > 0

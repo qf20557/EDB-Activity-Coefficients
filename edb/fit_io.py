@@ -1,13 +1,12 @@
 """Stage 2: reading the fit and cleaned EDB data exported by stage 1."""
 import math
-import os
 
 import numpy as np
 import pandas as pd
 
 from . import config
 from .config import MIN_POINTS, RADIUS_UNCERTAINTY_UM
-from .raw_data import Columns, is_binary
+from .raw_data import Columns, is_binary, open_source, source_size
 from .trace import Cancelled
 
 EDB_COLUMNS = ("time_s", "radius_corrected_um", "radius_corrected_err_um", "radius_raw_um")
@@ -37,7 +36,8 @@ def csv_uncertainty(df, cols, err_col, factor_col=None, raw_col=None, value_col=
 def read_fit_csv(path):
     """Return time (s), fitted corrected radius squared (um^2) and the radius uncertainty (um, or None) from a
     fit CSV exported by stage 1. Fits without a corrected-radius column are refused."""
-    df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
+    with open_source(path) as handle:
+        df = pd.read_csv(handle, sep=None, engine="python", encoding="utf-8-sig")
     cols = {str(c).strip().lower(): c for c in df.columns}
     if "time_s" not in cols:
         raise ValueError("This file has no 'time_s' column. Load a fit CSV exported by stage 1.")
@@ -67,14 +67,51 @@ def clean_fit_arrays(t, r2):
     return t, r2
 
 
+def _read_edb_arrow(path, sep, cols, size, progress, cancel):
+    import pyarrow as pa
+    import pyarrow.csv as pacsv
+
+    wanted = [cols[c] for c in EDB_COLUMNS if c in cols]
+    ro = pacsv.ReadOptions(block_size=config.READ_BLOCK_BYTES, encoding="utf8")
+    po = pacsv.ParseOptions(delimiter=sep)
+    co = pacsv.ConvertOptions(include_columns=wanted)
+    out, sigma, first = Columns(2), None, True
+    with open_source(path) as handle:
+        # Strip UTF-8 BOM if present before streaming to PyArrow
+        prefix = handle.read(3)
+        if prefix != b"\xef\xbb\xbf":
+            handle.seek(0)
+        reader = pacsv.open_csv(handle, read_options=ro, parse_options=po, convert_options=co)
+        for batch in reader:
+            if cancel is not None and cancel():
+                raise Cancelled()
+            t = batch[cols["time_s"]].cast(pa.float64(), safe=False).to_numpy()
+            r = batch[cols["radius_corrected_um"]].cast(pa.float64(), safe=False).to_numpy()
+            good = np.isfinite(t) & np.isfinite(r) & (r > 0)
+            if first:
+                df_head = batch.slice(0, min(len(batch), 4096)).to_pandas()
+                sigma = csv_uncertainty(
+                    df_head, cols, "radius_corrected_err_um", raw_col="radius_raw_um", value_col="radius_corrected_um"
+                )
+                pos = handle.tell()
+                out.reserve(int(len(batch) / max(pos, 1) * size * 1.02) + 1024)
+                first = False
+            out.append(t[good], r[good])
+            if progress is not None:
+                progress(min(handle.tell() / size, 1.0))
+    if not out.n:
+        raise ValueError("No valid time / corrected radius rows found in the cleaned CSV.")
+    return (*out.finish(), sigma)
+
+
 def read_edb_csv(path, progress=None, cancel=None):
     """Cleaned EDB data saved by stage 1: (time, corrected radius, radius uncertainty or None). CSV (header
-    required: time_s and radius_corrected_um) or .npz. The CSV is read with the C parser in blocks, keeping only the
-    columns needed, so a multi-GB file costs 16 bytes of memory per row; the uncertainty is taken from the first
-    block (stage 1 writes the same value on every row). progress(fraction) and cancel() -> bool are optional."""
+    required: time_s and radius_corrected_um) or .npz. Reads in blocks with PyArrow (or pandas fallback) keeping only
+    the columns needed, so a multi-GB file costs 16 bytes of memory per row."""
     if is_binary(path):
         return read_edb_binary(path)
-    with open(path, "rb") as handle:
+    size = source_size(path) or 1
+    with open_source(path) as handle:
         header = handle.readline().decode("utf-8-sig", "replace")
         handle.seek(0)
         sep = max(",", "\t", ";", "|", key=header.count)
@@ -84,8 +121,16 @@ def read_edb_csv(path, progress=None, cancel=None):
         if "time_s" not in cols or "radius_corrected_um" not in cols:
             raise ValueError("This file has no 'time_s' and 'radius_corrected_um' columns. Load cleaned data saved "
                              "by stage 1 ('Save cleaned data'), not a raw EDB file.")
-        handle.seek(0)
-        size = os.path.getsize(path) or 1
+
+    if len(sep) == 1:
+        try:
+            return _read_edb_arrow(path, sep, cols, size, progress, cancel)
+        except Cancelled:
+            raise
+        except Exception:
+            pass
+
+    with open_source(path) as handle:
         out, sigma, first = Columns(2), None, True
         for chunk in pd.read_csv(handle, sep=sep, encoding="utf-8-sig", chunksize=config.CHUNK_ROWS,
                                  usecols=[cols[c] for c in EDB_COLUMNS if c in cols]):
@@ -109,16 +154,17 @@ def read_edb_csv(path, progress=None, cancel=None):
 
 def read_edb_binary(path):
     """Cleaned .npz saved by stage 1 (raw_data.write_cleaned)."""
-    with np.load(path) as saved:
-        if "time_s" not in saved or "radius_raw_um" not in saved:
-            raise ValueError("This .npz file is not cleaned data saved by stage 1 ('Save cleaned data').")
-        factor = float(saved["radius_correction_factor"]) if "radius_correction_factor" in saved else 1.0
-        sigma = float(saved["radius_uncertainty_um"]) if "radius_uncertainty_um" in saved else math.nan
-        t, r = saved["time_s"], saved["radius_raw_um"]
+    with open_source(path) as handle:
+        with np.load(handle) as saved:
+            if "time_s" not in saved or "radius_raw_um" not in saved:
+                raise ValueError("This .npz file is not cleaned data saved by stage 1 ('Save cleaned data').")
+            factor = float(saved["radius_correction_factor"]) if "radius_correction_factor" in saved else 1.0
+            sigma = float(saved["radius_uncertainty_um"]) if "radius_uncertainty_um" in saved else math.nan
+            t, r = saved["time_s"], saved["radius_raw_um"]
     good = np.isfinite(t) & np.isfinite(r) & (r > 0)
     if not good.any():
         raise ValueError("No valid time / radius rows found in the cleaned file.")
     if not good.all():
         t, r = t[good], r[good]
-    r *= factor
+    r = r * factor
     return t, r, sigma if math.isfinite(sigma) and sigma > 0 else RADIUS_UNCERTAINTY_UM * factor

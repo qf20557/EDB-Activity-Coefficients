@@ -1,176 +1,228 @@
-"""Small Tk building blocks shared by the stages."""
-import queue
-import threading
-import tkinter as tk
-from tkinter import ttk
+"""Shared Streamlit helpers: native OS file dialogs (Win32 ctypes, no Tk), Plotly box parsing, compound matching."""
+import ctypes
+from ctypes import wintypes
+import math
+from pathlib import Path
+import sys
 
-from ..config import MAX_PLOT_POINTS
-from ..trace import Cancelled
+OFN_OVERWRITEPROMPT = 0x00000002
+OFN_NOCHANGEDIR = 0x00000008
+OFN_ALLOWMULTISELECT = 0x00000200
+OFN_PATHMUSTEXIST = 0x00000800
+OFN_FILEMUSTEXIST = 0x00001000
+OFN_EXPLORER = 0x00080000
 
-
-def scrollable(parent):
-    """A vertically scrolling frame. The content fills the window when it fits and scrolls when it does not."""
-    outer = ttk.Frame(parent)
-    canvas = tk.Canvas(outer, highlightthickness=0)
-    bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-    canvas.configure(yscrollcommand=bar.set)
-    canvas.pack(side="left", fill="both", expand=True)
-    bar.pack(side="right", fill="y")
-    content = ttk.Frame(canvas)
-    window = canvas.create_window((0, 0), window=content, anchor="nw")
-
-    def fit(_=None):
-        height = max(canvas.winfo_height(), content.winfo_reqheight())
-        canvas.itemconfigure(window, width=canvas.winfo_width(), height=height)
-        canvas.configure(scrollregion=(0, 0, canvas.winfo_width(), height))
-
-    content.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
-    canvas.bind("<Configure>", fit)
-    return outer, content
+WS_POPUP = 0x80000000
+WS_EX_TOPMOST = 0x00000008
+WS_EX_TOOLWINDOW = 0x00000080
+HWND_TOPMOST = wintypes.HWND(-1)
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+SWP_SHOWWINDOW = 0x0040
 
 
-def scroll_column(parent):
-    """A column as wide as its content that scrolls vertically, with a scroll bar and the mouse wheel anywhere over
-    it. Returns (outer, content, wheel): bind wheel to widgets whose own wheel binding should scroll the column
-    instead (comboboxes otherwise change value)."""
-    outer = ttk.Frame(parent)
-    canvas = tk.Canvas(outer, highlightthickness=0, yscrollincrement=20)
-    bar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-    canvas.configure(yscrollcommand=bar.set)
-    bar.pack(side="right", fill="y")
-    canvas.pack(side="left", fill="y")
-    content = ttk.Frame(canvas)
-    canvas.create_window((0, 0), window=content, anchor="nw")
-    content.bind("<Configure>", lambda _: canvas.configure(width=content.winfo_reqwidth(),
-                                                           scrollregion=canvas.bbox("all")))
-
-    def wheel(event):
-        if canvas.yview() != (0.0, 1.0):
-            notches = event.delta / 120 if event.delta else (1 if event.num == 4 else -1)  # Button-4/5: X11
-            canvas.yview_scroll(-round(3 * notches) or (-1 if notches > 0 else 1), "units")
-        return "break"
-
-    def over_column(event):
-        # Tcl path, not a widget: the combobox drop-down list has no tkinter object
-        path = str(outer.tk.call("winfo", "containing", event.x_root, event.y_root))
-        if path == str(outer) or path.startswith(str(outer) + "."):
-            return wheel(event)
-
-    for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-        parent.winfo_toplevel().bind(sequence, over_column, add="+")
-    return outer, content, wheel
+class _OPENFILENAMEW(ctypes.Structure):
+    _fields_ = [
+        ("lStructSize", wintypes.DWORD),
+        ("hwndOwner", wintypes.HWND),
+        ("hInstance", wintypes.HINSTANCE),
+        ("lpstrFilter", wintypes.LPCWSTR),
+        ("lpstrCustomFilter", wintypes.LPWSTR),
+        ("nMaxCustFilter", wintypes.DWORD),
+        ("nFilterIndex", wintypes.DWORD),
+        ("lpstrFile", wintypes.LPWSTR),
+        ("nMaxFile", wintypes.DWORD),
+        ("lpstrFileTitle", wintypes.LPWSTR),
+        ("nMaxFileTitle", wintypes.DWORD),
+        ("lpstrInitialDir", wintypes.LPCWSTR),
+        ("lpstrTitle", wintypes.LPCWSTR),
+        ("Flags", wintypes.DWORD),
+        ("nFileOffset", wintypes.WORD),
+        ("nFileExtension", wintypes.WORD),
+        ("lpstrDefExt", wintypes.LPCWSTR),
+        ("lCustData", wintypes.LPARAM),
+        ("lpfnHook", wintypes.LPVOID),
+        ("lpTemplateName", wintypes.LPCWSTR),
+        ("pvReserved", wintypes.LPVOID),
+        ("dwReserved", wintypes.DWORD),
+        ("FlagsEx", wintypes.DWORD),
+    ]
 
 
-def nav_bar(parent, back=None, next_=None, next_text="Next →"):
-    bar = ttk.Frame(parent, padding=(6, 4))
-    bar.pack(fill="x", side="bottom")
-    ttk.Separator(parent, orient="horizontal").pack(fill="x", side="bottom")
-    if next_ is not None:
-        ttk.Button(bar, text=next_text, command=next_).pack(side="right", padx=4)
-    if back is not None:
-        ttk.Button(bar, text="← Back", command=back).pack(side="right", padx=4)
-    return bar
+def _win32_apis():
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    comdlg32 = ctypes.WinDLL("comdlg32", use_last_error=True)
+
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+    ]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.DestroyWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+
+    comdlg32.GetOpenFileNameW.argtypes = [ctypes.POINTER(_OPENFILENAMEW)]
+    comdlg32.GetOpenFileNameW.restype = wintypes.BOOL
+    comdlg32.GetSaveFileNameW.argtypes = [ctypes.POINTER(_OPENFILENAMEW)]
+    comdlg32.GetSaveFileNameW.restype = wintypes.BOOL
+    return user32, comdlg32
 
 
-class Progress(ttk.Frame):
-    """A progress bar with a Cancel button that runs slow work (reading or saving a large file) on a background
-    thread, so the window keeps responding. Hidden unless something is running."""
-
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.busy = False
-        self.text = tk.StringVar()
-        self.bar = ttk.Progressbar(self, length=220, maximum=1.0)
-        self.button = ttk.Button(self, text="Cancel", command=self.cancel)
-        self.stop = threading.Event()
-        for widget in (ttk.Label(self, textvariable=self.text), self.bar, self.button):
-            widget.pack(side="left", padx=3)
-
-    def cancel(self):
-        self.stop.set()
-        self.text.set("Cancelling...")
-
-    def run(self, text, work, done, failed, cancelled=None, lock=()):
-        """Run work(progress, cancel) on a thread, then call done(result) or failed(error) on the Tk thread.
-        progress takes a fraction from 0 to 1; cancel() is True once Cancel is pressed, and work should then raise
-        Cancelled. The widgets in lock are disabled meanwhile. Returns False if something is already running."""
-        if self.busy:
-            return False
-        self.busy, self.stop = True, threading.Event()
-        messages, stop = queue.SimpleQueue(), self.stop
-        self.text.set(text)
-        self.bar["value"] = 0
-        self.pack(side="left", padx=8)
-        for widget in lock:
-            widget.state(["disabled"])
-
-        def target():
-            try:
-                messages.put(("done", work(lambda fraction: messages.put(("progress", fraction)), stop.is_set)))
-            except Cancelled:
-                messages.put(("cancelled", None))
-            except Exception as error:
-                messages.put(("failed", error))
-
-        def poll():
-            kind = value = None
-            while not messages.empty():
-                kind, value = messages.get()
-                if kind != "progress":
-                    break
-            if kind == "progress":
-                self.bar["value"] = value
-                if not stop.is_set():
-                    self.text.set(f"{text} {100 * value:.0f}%")
-            if kind in (None, "progress"):
-                self.after(40, poll)
-                return
-            self.busy = False
-            self.pack_forget()
-            for widget in lock:
-                widget.state(["!disabled"])
-            if kind == "done":
-                done(value)
-            elif kind == "failed":
-                failed(value)
-            elif cancelled is not None:
-                cancelled()
-
-        threading.Thread(target=target, daemon=True).start()
-        self.after(40, poll)
-        return True
+def _build_filter_str(filetypes):
+    """Build double-NUL-terminated Win32 filter string from [(label, '*.a;*.b'), ...]."""
+    chunks = []
+    for desc, pattern in filetypes:
+        win_pat = ";".join(p.strip() for p in pattern.replace(",", " ").split() if p.strip())
+        chunks.append(f"{desc}\0{win_pat}")
+    return "\0".join(chunks) + "\0\0"
 
 
-class PointView:
-    """The points of a trace that are drawn (see Trace.display), recomputed only when the x range, the stride or the
-    culled points change, and re-thinned shortly after the x range of the axes stops changing so that zooming in
-    brings back the detail."""
+def ask_open_files(title="Select file(s)", filetypes=(("All files", "*.*"),), multiple=False, initial_dir=None):
+    """Open a native Windows File Explorer open-file dialog on top of the browser.
+    Returns a list of selected file paths (if multiple=True) or a single path string / None."""
+    if sys.platform != "win32":
+        return [] if multiple else None
 
-    def __init__(self, widget, axis, redraw, delay=120):
-        self.widget, self.axis, self.redraw, self.delay = widget, axis, redraw, delay
-        self.trace = self.key = self.job = None
-        self.points, self.thinned = (), False
-        axis.callbacks.connect("xlim_changed", self.moved)
+    user32, comdlg32 = _win32_apis()
+    hwnd = user32.CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW, "STATIC", "", WS_POPUP, 120, 120, 1, 1, None, None, None, None
+    )
+    try:
+        if hwnd:
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+            user32.SetForegroundWindow(hwnd)
 
-    def moved(self, _):
-        if self.job is not None:
-            self.widget.after_cancel(self.job)
-        self.job = self.widget.after(self.delay, self.settle)
+        buf_len = 65536 if multiple else 4096
+        buf = ctypes.create_unicode_buffer(buf_len)
+        flt = _build_filter_str(filetypes)
 
-    def settle(self):
-        self.job = None
-        self.redraw()
+        ofn = _OPENFILENAMEW()
+        ofn.lStructSize = ctypes.sizeof(_OPENFILENAMEW)
+        ofn.hwndOwner = hwnd
+        ofn.lpstrFilter = flt
+        ofn.nFilterIndex = 1
+        ofn.lpstrFile = ctypes.cast(buf, wintypes.LPWSTR)
+        ofn.nMaxFile = buf_len
+        ofn.lpstrInitialDir = str(initial_dir) if initial_dir else None
+        ofn.lpstrTitle = title
+        flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR
+        if multiple:
+            flags |= OFN_ALLOWMULTISELECT
+        ofn.Flags = flags
 
-    def get(self, trace, stride, whole=False):
-        """(t, r, changed) for the current x range plus half a width each side, or for the whole trace."""
-        lo = hi = None
-        if stride is None and not whole:
-            lo, hi = sorted(self.axis.get_xlim())
-            lo, hi = lo - (hi - lo) / 2, hi + (hi - lo) / 2
-        rows = None if stride is not None else trace.window(lo, hi)
-        key = (trace.version, stride, rows)
-        changed = trace is not self.trace or key != self.key
-        if changed:
-            self.trace, self.key, self.points = trace, key, trace.display(lo, hi, stride)
-            self.thinned = rows is not None and rows[1] - rows[0] > MAX_PLOT_POINTS
-        return (*self.points, changed)
+        if not comdlg32.GetOpenFileNameW(ctypes.byref(ofn)):
+            return [] if multiple else None
+
+        if not multiple:
+            return buf.value or None
+
+        raw = ctypes.wstring_at(ctypes.addressof(buf), buf_len)
+        end = raw.find("\0\0")
+        if end != -1:
+            raw = raw[:end]
+        parts = [p for p in raw.split("\0") if p]
+        if not parts:
+            return []
+        if len(parts) == 1:
+            return [parts[0]]
+        folder = Path(parts[0])
+        return [str(folder / name) for name in parts[1:]]
+    finally:
+        if hwnd:
+            user32.DestroyWindow(hwnd)
+
+
+def ask_save_file(title="Save file", filetypes=(("CSV (*.csv)", "*.csv"),), initial_file="", default_ext=".csv",
+                  initial_dir=None):
+    """Open a native Windows File Explorer Save-As dialog on top of the browser.
+    Returns the chosen file path string (with appropriate extension applied) or None if cancelled."""
+    if sys.platform != "win32":
+        return None
+
+    user32, comdlg32 = _win32_apis()
+    hwnd = user32.CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW, "STATIC", "", WS_POPUP, 120, 120, 1, 1, None, None, None, None
+    )
+    try:
+        if hwnd:
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+            user32.SetForegroundWindow(hwnd)
+
+        buf_len = 4096
+        buf = ctypes.create_unicode_buffer(initial_file, buf_len)
+        flt = _build_filter_str(filetypes)
+
+        ofn = _OPENFILENAMEW()
+        ofn.lStructSize = ctypes.sizeof(_OPENFILENAMEW)
+        ofn.hwndOwner = hwnd
+        ofn.lpstrFilter = flt
+        ofn.nFilterIndex = 1
+        ofn.lpstrFile = ctypes.cast(buf, wintypes.LPWSTR)
+        ofn.nMaxFile = buf_len
+        ofn.lpstrInitialDir = str(initial_dir) if initial_dir else None
+        ofn.lpstrTitle = title
+        ofn.lpstrDefExt = default_ext.lstrip(".") if default_ext else None
+        ofn.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR
+
+        if not comdlg32.GetSaveFileNameW(ctypes.byref(ofn)):
+            return None
+
+        chosen = Path(buf.value)
+        # Apply the extension of the selected filter dropdown item if none or mismatched with filter
+        idx = int(ofn.nFilterIndex) - 1
+        if 0 <= idx < len(filetypes):
+            patterns = [p.strip() for p in filetypes[idx][1].replace(";", " ").split() if p.strip().startswith("*.")]
+            exts = [p[1:].lower() for p in patterns if p != "*.*"]
+            if exts and chosen.suffix.lower() not in exts:
+                chosen = chosen.with_suffix(exts[0])
+        elif default_ext and not chosen.suffix:
+            chosen = chosen.with_suffix(default_ext if default_ext.startswith(".") else f".{default_ext}")
+        return str(chosen)
+    finally:
+        if hwnd:
+            user32.DestroyWindow(hwnd)
+
+
+def match_compound(compounds, preferred):
+    """Find `preferred` in `compounds` (exact first, then case-insensitive), else return the first compound name."""
+    if not compounds:
+        return ""
+    if preferred in compounds:
+        return preferred
+    target = preferred.strip().lower()
+    for name in compounds:
+        if name.strip().lower() == target:
+            return name
+    return next(iter(compounds))
+
+
+def extract_selection_box(state):
+    """Return (xmin, xmax, ymin, ymax) from a Streamlit Plotly selection state dict, or None."""
+    if not state:
+        return None
+    sel = state.get("selection") if isinstance(state, dict) else getattr(state, "selection", None)
+    if not sel:
+        return None
+    boxes = sel.get("box") if isinstance(sel, dict) else getattr(sel, "box", None)
+    if not boxes:
+        return None
+    box = boxes[-1]
+    xs = box.get("x", [])
+    ys = box.get("y", [])
+    if len(xs) < 2 or len(ys) < 2:
+        return None
+    try:
+        x0, x1 = sorted((float(xs[0]), float(xs[1])))
+        y0, y1 = sorted((float(ys[0]), float(ys[1])))
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (x0, x1, y0, y1)):
+        return None
+    return x0, x1, y0, y1
